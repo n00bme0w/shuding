@@ -1,0 +1,33 @@
+{
+  "name": "shuding",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "main": "out/main/index.js",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "FONTCONFIG_FILE=\"$PWD/fontconfig/fonts.conf\" FONTCONFIG_PATH=\"$PWD/fontconfig\" electron-vite build",
+    "rebuild:native": "electron-rebuild -f -w better-sqlite3",
+    "postinstall": "npm run rebuild:native",
+    "preview": "FONTCONFIG_FILE=\"$PWD/fontconfig/fonts.conf\" FONTCONFIG_PATH=\"$PWD/fontconfig\" electron-vite preview",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "pdfjs-dist": "^4.7.76",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^4.2.0",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.3.1",
+    "@types/react": "^19.1.9",
+    "@types/react-dom": "^19.1.7",
+    "@vitejs/plugin-react": "^5.0.2",
+    "electron": "^38.0.0",
+    "electron-vite": "^4.0.0",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.3"
+  }
+}
