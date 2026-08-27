@@ -17,6 +17,7 @@
     "@earendil-works/pi-agent-core": "file:../pi/packages/agent",
     "@earendil-works/pi-ai": "file:../pi/packages/ai",
     "better-sqlite3": "^11.10.0",
+    "marked": "^18.0.11",
     "pdfjs-dist": "^4.7.76",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"
