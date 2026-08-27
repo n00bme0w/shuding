@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "main": "out/main/index.js",
+  "license": "Apache-2.0",
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "build": "FONTCONFIG_FILE=\"$PWD/fontconfig/fonts.conf\" FONTCONFIG_PATH=\"$PWD/fontconfig\" electron-vite build",
