@@ -19,12 +19,16 @@ import type {
 import {
   createAnchor,
   deleteAnchor,
+  deleteConversation,
   getAiSettings,
   getAnchorById,
   getNotesByAnchorIds,
+  listConversationsByDocument,
   saveAiSettings,
   saveAnchor,
-  saveNote
+  saveConversation,
+  saveNote,
+  type StoredConversation
 } from '../../db/store';
 
 const PROVIDER_ID = 'shuding-openai-compatible';
@@ -147,6 +151,44 @@ function getLiveSession(conversationId: string, ownerWebContentsId?: number) {
 
 function touch(session: Session) { session.lastUsedAt = Date.now(); }
 
+function persistSession(session: Session) {
+  saveConversation({ id: session.id, documentFingerprint: session.documentFingerprint, context: session.context, source: session.source, messages: session.messages, lastUsedAt: session.lastUsedAt });
+}
+
+function hydrateSession(stored: StoredConversation, owner: ConversationOwner): Session {
+  const context = JSON.parse(stored.contextJson) as ConversationContext;
+  const source = JSON.parse(stored.sourceJson) as Session['source'];
+  return {
+    id: stored.id,
+    context,
+    documentFingerprint: stored.documentFingerprint,
+    source,
+    owner,
+    messages: JSON.parse(stored.messagesJson) as AgentMessage[],
+    lastUsedAt: new Date(stored.lastUsedAt).getTime(),
+    status: 'idle',
+    removed: false
+  };
+}
+
+function loadSessionsForDocument(documentId: string, webContentsId: number) {
+  if (sessionsByDocument.has(documentId)) {
+    return;
+  }
+  const owner: ConversationOwner = { webContentsId, emit: () => {} };
+  const storedSessions = listConversationsByDocument(documentId, MAX_SESSIONS_PER_DOCUMENT);
+  for (const stored of storedSessions) {
+    if (sessions.has(stored.id)) {
+      continue;
+    }
+    const session = hydrateSession(stored, owner);
+    sessions.set(session.id, session);
+    const documentSessions = sessionsByDocument.get(documentId) ?? new Set<string>();
+    documentSessions.add(session.id);
+    sessionsByDocument.set(documentId, documentSessions);
+  }
+}
+
 function emitIfLive(session: Session, event: ConversationEvent) {
   if (sessions.get(session.id) === session && !session.removed) session.owner.emit(event);
 }
@@ -161,7 +203,7 @@ function removeSession(session: Session) {
   proposals.delete(session.id);
 }
 
-async function discardSession(session: Session) {
+async function discardSession(session: Session, deleteFromDisk = false) {
   const ongoing = discarding.get(session.id);
   if (ongoing) return ongoing;
   const discard = (async () => {
@@ -173,6 +215,7 @@ async function discardSession(session: Session) {
       await active.settlement;
     }
     removeSession(session);
+    if (deleteFromDisk) deleteConversation(session.id);
   })();
   discarding.set(session.id, discard);
   try { await discard; } finally { discarding.delete(session.id); }
@@ -182,7 +225,7 @@ async function makeRoom(documentId: string) {
   const documentSessions = sessionsByDocument.get(documentId);
   if (!documentSessions || documentSessions.size < MAX_SESSIONS_PER_DOCUMENT) return;
   const lru = Array.from(documentSessions, (id) => sessions.get(id)).filter((session): session is Session => Boolean(session)).sort((a, b) => a.lastUsedAt - b.lastUsedAt || a.id.localeCompare(b.id))[0];
-  if (lru) await discardSession(lru);
+  if (lru) await discardSession(lru, true);
 }
 
 function pendingFor(session: Session) {
@@ -265,21 +308,24 @@ export async function openConversation(context: ConversationContext, owner: Conv
   const fingerprint = documentFingerprint(context);
   const source = contextForTool(context);
   return await mutateDocument(fingerprint, async () => {
+    loadSessionsForDocument(fingerprint, owner.webContentsId);
     if (context.kind === 'saved-anchor') {
       const existing = Array.from(sessionsByDocument.get(fingerprint) ?? [], (id) => sessions.get(id)).find((session) => session && !session.removed && session.owner.webContentsId === owner.webContentsId && hasMatchingSource(session, context));
-      if (existing) { touch(existing); return snapshot(existing); }
+      if (existing) { touch(existing); persistSession(existing); return snapshot(existing); }
     }
     await makeRoom(fingerprint);
     const session: Session = { id: randomUUID(), context, documentFingerprint: fingerprint, source, owner, messages: [], lastUsedAt: Date.now(), status: 'idle', removed: false };
     sessions.set(session.id, session);
     const documentSessions = sessionsByDocument.get(fingerprint) ?? new Set<string>();
     documentSessions.add(session.id); sessionsByDocument.set(fingerprint, documentSessions);
+    persistSession(session);
     return snapshot(session);
   });
 }
 
 export function listConversationSessions(documentId: string, webContentsId: number): ConversationSessionSummary[] {
   requireText(documentId, 'document fingerprint', 256);
+  loadSessionsForDocument(documentId, webContentsId);
   return Array.from(sessionsByDocument.get(documentId) ?? [], (id) => getLiveSession(id, webContentsId)).filter((session): session is Session => Boolean(session)).sort((a, b) => b.lastUsedAt - a.lastUsedAt || a.id.localeCompare(b.id)).map(summary);
 }
 
@@ -300,7 +346,7 @@ export async function sendConversationMessage(conversationId: string, content: s
   activeConversations.set(conversationId, { agent, settlement, resolveSettlement }); session.status = 'running'; emitIfLive(session, { type: 'status', conversationId, status: 'running' });
   try {
     await agent.prompt(prompt);
-    if (getLiveSession(conversationId, owner.webContentsId)) { session.messages = agent.state.messages; touch(session); if (agent.state.errorMessage && !agent.signal?.aborted) emitIfLive(session, { type: 'error', conversationId, message: agent.state.errorMessage }); }
+    if (getLiveSession(conversationId, owner.webContentsId)) { session.messages = agent.state.messages; touch(session); persistSession(session); if (agent.state.errorMessage && !agent.signal?.aborted) emitIfLive(session, { type: 'error', conversationId, message: agent.state.errorMessage }); }
   } catch (error: unknown) {
     if (getLiveSession(conversationId, owner.webContentsId)) emitIfLive(session, { type: 'error', conversationId, message: error instanceof Error ? error.message : 'Conversation failed' });
     throw error;
@@ -333,9 +379,9 @@ export async function finalizeEphemeral(input: FinalizeEphemeralInput, webConten
   const selection = session.context.selection;
   const anchor = createAnchor({ documentId: selection.documentFingerprint, pageIndex: selection.pageIndex, kind: 'text', quote: selection.quote, normalizedQuote: selection.normalizedQuote, pageRect: selection.pageRect, normalizedRect: selection.normalizedRect });
   saveAnchor(anchor);
-  try { const note = body || proposal ? saveNote(anchor.id, body ?? proposal!.body) : null; removeSession(session); return { anchor, note }; } catch (error: unknown) { deleteAnchor(anchor.id); throw error; }
+  try { const note = body || proposal ? saveNote(anchor.id, body ?? proposal!.body) : null; removeSession(session); deleteConversation(session.id); return { anchor, note }; } catch (error: unknown) { deleteAnchor(anchor.id); throw error; }
 }
 
-export async function discardConversation(conversationId: string, webContentsId: number) { const session = getLiveSession(conversationId, webContentsId); if (session) await discardSession(session); }
+export async function discardConversation(conversationId: string, webContentsId: number) { const session = getLiveSession(conversationId, webContentsId); if (session) await discardSession(session, true); }
 export function abandonEphemeralConversation(conversationId: string, webContentsId: number) { return discardConversation(conversationId, webContentsId); }
 export function removeConversationOwner(webContentsId: number) { for (const session of Array.from(sessions.values())) if (session.owner.webContentsId === webContentsId) void discardSession(session); }

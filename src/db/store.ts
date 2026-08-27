@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import path from 'node:path';
 import { app } from 'electron';
 import { randomUUID } from 'node:crypto';
-import type { Anchor, AnchorDraft, Note, RecentDocument, Rect } from '../shared';
+import type { Anchor, AnchorDraft, ConversationContext, Note, RecentDocument, Rect } from '../shared';
 
 let db: Database.Database | null = null;
 
@@ -54,44 +54,82 @@ function getDb() {
   return db;
 }
 
-function migrate(database: Database.Database) {
-  const alreadyApplied = database
-    .prepare('select version from schemaMigrations where version = @version')
-    .get({ version: 1 }) as { version: number } | undefined;
-  if (alreadyApplied) {
-    return;
+const MIGRATIONS: ReadonlyArray<{ version: number; up: (database: Database.Database) => void }> = [
+  {
+    version: 1,
+    up(database) {
+      database.exec(`
+        create table if not exists aiSettings (
+          id integer primary key check (id = 1),
+          baseUrl text not null,
+          modelId text not null,
+          encryptedApiKey text,
+          updatedAt text not null
+        );
+        create table if not exists conversations (
+          id text primary key,
+          anchorId text not null unique references anchors(id) on delete cascade,
+          createdAt text not null,
+          updatedAt text not null
+        );
+        create table if not exists conversationMessages (
+          id text primary key,
+          conversationId text not null references conversations(id) on delete cascade,
+          role text not null check (role in ('user', 'assistant', 'toolResult')),
+          content text not null,
+          toolName text,
+          createdAt text not null,
+          payload text not null
+        );
+        create index if not exists conversationMessages_conversationId_createdAt_idx
+          on conversationMessages (conversationId, createdAt);
+      `);
+    }
+  },
+  {
+    version: 2,
+    up(database) {
+      // v1 left unused conversation tables whose schema (anchorId NOT NULL) cannot
+      // represent ephemeral-selection contexts. Replace them with a durable,
+      // context-aware conversations table used to persist session transcripts.
+      database.exec(`
+        drop table if exists conversationMessages;
+        drop table if exists conversations;
+        create table if not exists conversations (
+          id text primary key,
+          documentFingerprint text not null,
+          contextKind text not null,
+          anchorId text,
+          contextJson text not null,
+          sourceJson text not null,
+          quote text not null,
+          pageIndex integer not null,
+          messagesJson text not null,
+          lastUsedAt text not null,
+          createdAt text not null,
+          updatedAt text not null
+        );
+        create index if not exists conversations_document_lastused_idx
+          on conversations (documentFingerprint, lastUsedAt desc);
+      `);
+    }
   }
+];
+
+function migrate(database: Database.Database) {
+  const applied = database.prepare('select version from schemaMigrations order by version').all() as Array<{ version: number }>;
+  const appliedVersions = new Set(applied.map((row) => row.version));
 
   database.transaction(() => {
-    database.exec(`
-      create table if not exists aiSettings (
-        id integer primary key check (id = 1),
-        baseUrl text not null,
-        modelId text not null,
-        encryptedApiKey text,
-        updatedAt text not null
-      );
-      create table if not exists conversations (
-        id text primary key,
-        anchorId text not null unique references anchors(id) on delete cascade,
-        createdAt text not null,
-        updatedAt text not null
-      );
-      create table if not exists conversationMessages (
-        id text primary key,
-        conversationId text not null references conversations(id) on delete cascade,
-        role text not null check (role in ('user', 'assistant', 'toolResult')),
-        content text not null,
-        toolName text,
-        createdAt text not null,
-        payload text not null
-      );
-      create index if not exists conversationMessages_conversationId_createdAt_idx
-        on conversationMessages (conversationId, createdAt);
-    `);
-    database.prepare(
-      'insert into schemaMigrations (version, appliedAt) values (@version, @appliedAt)'
-    ).run({ version: 1, appliedAt: new Date().toISOString() });
+    for (const migration of MIGRATIONS) {
+      if (appliedVersions.has(migration.version)) {
+        continue;
+      }
+      migration.up(database);
+      database.prepare(
+        'insert into schemaMigrations (version, appliedAt) values (@version, @appliedAt)'
+      ).run({ version: migration.version, appliedAt: new Date().toISOString() });
+    }
   })();
 }
 
@@ -340,4 +378,94 @@ export function saveAiSettings(settings: StoredAiSettings) {
        encryptedApiKey = excluded.encryptedApiKey,
        updatedAt = excluded.updatedAt`
   ).run({ ...settings, updatedAt: new Date().toISOString() });
+}
+
+export type StoredConversation = {
+  id: string;
+  documentFingerprint: string;
+  contextKind: ConversationContext['kind'];
+  anchorId: string | null;
+  contextJson: string;
+  sourceJson: string;
+  quote: string;
+  pageIndex: number;
+  messagesJson: string;
+  lastUsedAt: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ConversationPersist = {
+  id: string;
+  documentFingerprint: string;
+  context: ConversationContext;
+  source: { quote: string; pageIndex: number; kind: string; documentFingerprint: string };
+  messages: unknown[];
+  lastUsedAt: number;
+};
+
+export function saveConversation(conversation: ConversationPersist) {
+  const database = getDb();
+  const now = new Date().toISOString();
+  const stored: StoredConversation = {
+    id: conversation.id,
+    documentFingerprint: conversation.documentFingerprint,
+    contextKind: conversation.context.kind,
+    anchorId: conversation.context.kind === 'saved-anchor' ? conversation.context.anchorId : null,
+    contextJson: JSON.stringify(conversation.context),
+    sourceJson: JSON.stringify(conversation.source),
+    quote: conversation.source.quote,
+    pageIndex: conversation.source.pageIndex,
+    messagesJson: JSON.stringify(conversation.messages),
+    lastUsedAt: new Date(conversation.lastUsedAt).toISOString(),
+    createdAt: now,
+    updatedAt: now
+  };
+  database.prepare(
+    `insert into conversations (
+      id, documentFingerprint, contextKind, anchorId, contextJson, sourceJson,
+      quote, pageIndex, messagesJson, lastUsedAt, createdAt, updatedAt
+    ) values (
+      @id, @documentFingerprint, @contextKind, @anchorId, @contextJson, @sourceJson,
+      @quote, @pageIndex, @messagesJson, @lastUsedAt, @createdAt, @updatedAt
+    )
+    on conflict(id) do update set
+      contextKind = excluded.contextKind,
+      anchorId = excluded.anchorId,
+      contextJson = excluded.contextJson,
+      sourceJson = excluded.sourceJson,
+      quote = excluded.quote,
+      pageIndex = excluded.pageIndex,
+      messagesJson = excluded.messagesJson,
+      lastUsedAt = excluded.lastUsedAt,
+      updatedAt = excluded.updatedAt`
+  ).run(stored);
+}
+
+export function getConversation(id: string): StoredConversation | null {
+  const database = getDb();
+  return database.prepare(
+    `select id, documentFingerprint, contextKind, anchorId, contextJson, sourceJson,
+            quote, pageIndex, messagesJson, lastUsedAt, createdAt, updatedAt
+     from conversations
+     where id = @id`
+  ).get({ id }) as StoredConversation | undefined ?? null;
+}
+
+export function listConversationsByDocument(documentFingerprint: string, limit: number): StoredConversation[] {
+  const database = getDb();
+  const boundedLimit = Math.max(0, Math.min(Math.floor(limit), 50));
+  return database.prepare(
+    `select id, documentFingerprint, contextKind, anchorId, contextJson, sourceJson,
+            quote, pageIndex, messagesJson, lastUsedAt, createdAt, updatedAt
+     from conversations
+     where documentFingerprint = @documentFingerprint
+     order by lastUsedAt desc
+     limit @limit`
+  ).all({ documentFingerprint, limit: boundedLimit }) as StoredConversation[];
+}
+
+export function deleteConversation(id: string) {
+  const database = getDb();
+  database.prepare('delete from conversations where id = @id').run({ id });
 }
