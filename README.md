@@ -10,7 +10,7 @@ Shuding turns "select → ask → summarize → archive" into one workflow: sele
 
 - **High-quality PDF reading**
   - PDF.js rendering with high-DPI sharpness (internal render scale follows device pixel ratio)
-  - Continuous vertical scrolling with zoom (75% – 250%)
+  - Continuous vertical scrolling with zoom (25% – 400%)
   - Windowed rendering: only pages near the viewport are rendered, keeping memory stable during long sessions
 - **Precise text selection**
   - Live highlight while dragging; multi-line selections are merged per line without overlapping or broken fragments
@@ -23,8 +23,10 @@ Shuding turns "select → ask → summarize → archive" into one workflow: sele
   - Agent runtime built on `@earendil-works/pi-agent-core` + `@earendil-works/pi-ai`
   - Any OpenAI-compatible endpoint (OpenAI, DeepSeek, SiliconFlow, etc.)
   - Multi-turn conversation, streaming replies, abort support
-  - Per-book LRU queue of up to 10 temporary sessions; the least recently used session is evicted automatically
-  - Unsaved sessions live in memory only — nothing is written to disk
+  - AI replies render Markdown — code blocks, lists, and quotes display cleanly in the panel
+  - Per-book LRU queue of up to 10 sessions; when exceeded, the least recently used session is evicted and permanently deleted
+  - Session history is persisted to local SQLite and survives app restarts; both memory and disk strictly keep at most 10 sessions per book
+  - Each conversation message is persisted as it happens, but permanent anchors/notes are written only when you explicitly choose to save
   - Permanent anchors/notes are created only when you explicitly choose "Save reference" or "Save summary as note"
 - **Local-first & privacy**
   - All data (anchors, notes, recent documents, AI settings) lives in local SQLite
@@ -32,7 +34,10 @@ Shuding turns "select → ask → summarize → archive" into one workflow: sele
   - The agent registers no shell/filesystem/network tools; it can only propose a note summary, and the app performs the confirmed write
 - **Drawer-first reading UI**
   - Default layout is library + wide reader; the right drawer opens on demand
+  - The panel is part of the layout: opening it squeezes the PDF reader and never covers the top toolbar
+  - Panel width is draggable (300px – 560px) for roomy reading or long conversations
   - Annotations / Note / AI are mutually exclusive drawer modes — one task at a time
+  - The AI drawer lets you switch between the active conversation and the session list
   - AI configuration lives in a dedicated settings modal, not the reading surface
 
 ## UI navigation
@@ -94,8 +99,8 @@ cd ../pi/packages/agent && npm run build
 
 - Database location: `shuding.sqlite3` in the Electron `userData` directory
 - Stored: anchors, notes, recent documents, AI settings (including the encrypted API key)
-- AI conversations: temporary sessions live in main-process memory, grouped per book, up to 10 per book with LRU eviction
-- When a session is evicted or the app exits, conversation history is not retained; what persists is the anchors and notes you explicitly saved
+- AI conversations: session history is persisted in the `conversations` table, grouped per book; strictly at most 10 sessions are kept per book, and an LRU-evicted session is deleted from both memory and disk
+- After a restart or app exit, the most recent 10 conversations are not lost; what persists long-term are the anchors and notes you explicitly saved
 
 ## Tech stack
 
@@ -112,5 +117,5 @@ cd ../pi/packages/agent && npm run build
 ## Current status
 
 - 0.1.0 prototype stage
-- Done: PDF rendering, continuous scroll, zoom, selection/anchor/notes, recent documents, Pi-powered multi-turn AI chat, LRU session queue, drawer-first UI, secure credential storage
+- Done: PDF rendering, continuous scroll, zoom, selection/anchor/notes, recent documents, Pi-powered multi-turn AI chat, LRU session queue, session history persistence, drawer-first UI, secure credential storage
 - Not yet: local OCR for scanned PDFs, formula OCR, book-wide `search_document`, web research tool, packaging/distribution
