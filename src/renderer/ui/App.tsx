@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { getDocument, GlobalWorkerOptions, TextLayer, type PDFDocumentProxy, type PDFPageProxy } from 'pdfjs-dist';
+import { marked } from 'marked';
 import { normalizeQuote } from '../../shared';
 import type {
   AiSettings,
@@ -15,6 +16,23 @@ import type {
 } from '../../shared';
 
 GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.mjs', import.meta.url).toString();
+
+marked.setOptions({ breaks: true, gfm: true });
+
+// Lightweight, safe-enough markdown rendering for assistant replies.
+// We disallow raw HTML by escaping it first so model output can't inject scripts.
+function renderMarkdown(source: string) {
+  const escaped = source
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+  return marked.parse(escaped, { async: false }) as string;
+}
+
+function MarkdownContent({ source }: { source: string }) {
+  const html = useMemo(() => renderMarkdown(source), [source]);
+  // eslint-disable-next-line react/no-danger
+  return <div className="markdown-body" dangerouslySetInnerHTML={{ __html: html }} />;
+}
 
 type PageRect = {
   x: number;
@@ -52,9 +70,8 @@ type SelectionGeometry = {
 };
 
 const DEFAULT_SCALE = 1.5;
-const MIN_SCALE = 0.75;
-const MAX_SCALE = 2.5;
-const ZOOM_STEP = 0.25;
+const MIN_SCALE = 0.25;
+const MAX_SCALE = 4;
 const PAGE_WINDOW_RADIUS = 3;
 const MAX_OUTPUT_SCALE = 2;
 const FALLBACK_PAGE_DIMENSIONS = { width: 612, height: 792 };
@@ -64,8 +81,23 @@ const SELECTION_MERGE_GAP = 6;
 const SELECTION_HORIZONTAL_PADDING = 1.5;
 const SELECTION_VERTICAL_PADDING = 1;
 
+const DRAWER_MIN = 300;
+const DRAWER_DEFAULT = 380;
+const DRAWER_MAX = 560;
+
+type AiView = 'chat' | 'list';
+
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
+}
+
+function nextZoom(current: number, direction: -1 | 1) {
+  const floor = Math.round(current * 100);
+  let step = 5;
+  if (floor >= 100 && floor <= 200) step = 10;
+  if (floor > 200) step = 25;
+  const next = floor + direction * step;
+  return clamp(next / 100, MIN_SCALE, MAX_SCALE);
 }
 
 function getSelectionGeometry(selection: Selection): SelectionGeometry | null {
@@ -459,6 +491,10 @@ export function App() {
   const [savingProposal, setSavingProposal] = useState(false);
   const [ephemeralSummary, setEphemeralSummary] = useState('');
   const [drawerMode, setDrawerMode] = useState<DrawerMode>(null);
+  const [drawerWidth, setDrawerWidth] = useState(DRAWER_DEFAULT);
+  const [isResizingDrawer, setIsResizingDrawer] = useState(false);
+  const [aiView, setAiView] = useState<AiView>('chat');
+  const [quoteExpanded, setQuoteExpanded] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [selectionActionPosition, setSelectionActionPosition] = useState<SelectionActionPosition | null>(null);
   const [selectionActionError, setSelectionActionError] = useState<string | null>(null);
@@ -473,6 +509,7 @@ export function App() {
   const conversationRef = useRef<ConversationSnapshot | null>(null);
   const conversationSnapshotsRef = useRef(new Map<string, ConversationSnapshot>());
   const draftSelectionRef = useRef<DraftSelection | null>(null);
+  const drawerResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
 
   useEffect(() => {
     openedDocumentRef.current = openedDocument;
@@ -492,6 +529,10 @@ export function App() {
       conversationSnapshotsRef.current.set(conversation.conversationId, conversation);
     }
   }, [conversation]);
+
+  useEffect(() => {
+    setQuoteExpanded(false);
+  }, [activeConversationContext, conversation?.conversationId]);
 
   useEffect(() => {
     conversationRunningRef.current = conversationRunning;
@@ -1151,6 +1192,7 @@ export function App() {
     if (openedDocumentRef.current?.fingerprint !== currentDocumentId) return;
     setSelectionActionError(null);
     setSelectionActionPosition(null);
+    setAiView('chat');
     setDrawerMode('ai');
     try {
       const snapshot = await window.shuding.openConversation({
@@ -1181,6 +1223,7 @@ export function App() {
     const cached = conversationSnapshotsRef.current.get(session.conversationId);
     if (cached) {
       activateConversation(cached, session.status);
+      setAiView('chat');
       setDrawerMode('ai');
       return;
     }
@@ -1207,6 +1250,7 @@ export function App() {
       }
       const snapshot = await window.shuding.openConversation(context);
       activateConversation(snapshot, session.status);
+      setAiView('chat');
       setDrawerMode('ai');
       await refreshConversationSessions();
     } catch (error: unknown) {
@@ -1230,9 +1274,36 @@ export function App() {
   }
 
   function toggleDrawer(mode: Exclude<DrawerMode, null>) {
-    setDrawerMode((current) => current === mode ? null : mode);
+    setDrawerMode((current) => {
+      const next = current === mode ? null : mode;
+      if (next === 'ai') {
+        setAiView(conversation ? 'chat' : 'list');
+      }
+      return next;
+    });
     if (mode === 'ai') {
       void refreshConversationSessions();
+    }
+  }
+
+  function startDrawerResize(event: React.PointerEvent<HTMLDivElement>) {
+    drawerResizeRef.current = { startX: event.clientX, startWidth: drawerWidth };
+    setIsResizingDrawer(true);
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function moveDrawerResize(event: React.PointerEvent<HTMLDivElement>) {
+    const drag = drawerResizeRef.current;
+    if (!drag) return;
+    const delta = event.clientX - drag.startX;
+    setDrawerWidth(clamp(drag.startWidth - delta, DRAWER_MIN, DRAWER_MAX));
+  }
+
+  function endDrawerResize(event: React.PointerEvent<HTMLDivElement>) {
+    drawerResizeRef.current = null;
+    setIsResizingDrawer(false);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
     }
   }
 
@@ -1434,7 +1505,10 @@ export function App() {
   }
 
   return (
-    <div className={`shell${drawerMode ? ' drawer-open' : ''}`}>
+    <div
+      className={`shell${drawerMode ? ' drawer-open' : ''}`}
+      style={drawerMode ? ({ '--drawer-width': `${drawerWidth}px` } as React.CSSProperties) : undefined}
+    >
       <aside className="sidebar">
         <div>
           <div className="brand">书钉</div>
@@ -1525,9 +1599,9 @@ export function App() {
               </button>
             </div>
             <div className="zoom-controls" aria-label="缩放控制">
-              <button type="button" aria-label="缩小" onClick={() => setScale((value) => Math.max(MIN_SCALE, value - ZOOM_STEP))} disabled={!pdf || scale <= MIN_SCALE}>-</button>
+              <button type="button" aria-label="缩小" onClick={() => setScale((value) => nextZoom(value, -1))} disabled={!pdf || scale <= MIN_SCALE}>-</button>
               <button type="button" className="zoom-reset" onClick={() => setScale(DEFAULT_SCALE)} disabled={!pdf || scale === DEFAULT_SCALE}>{Math.round(scale * 100)}%</button>
-              <button type="button" aria-label="放大" onClick={() => setScale((value) => Math.min(MAX_SCALE, value + ZOOM_STEP))} disabled={!pdf || scale >= MAX_SCALE}>+</button>
+              <button type="button" aria-label="放大" onClick={() => setScale((value) => nextZoom(value, 1))} disabled={!pdf || scale >= MAX_SCALE}>+</button>
             </div>
           </div>
         </header>
@@ -1566,7 +1640,17 @@ export function App() {
       </main>
 
       {drawerMode ? (
-      <aside className="drawer" id="contextual-drawer" aria-label={drawerMode === 'annotations' ? '标注' : drawerMode === 'note' ? '笔记' : 'AI 对话'}>
+      <aside className="drawer" id="contextual-drawer" data-resizing={isResizingDrawer || undefined} aria-label={drawerMode === 'annotations' ? '标注' : drawerMode === 'note' ? '笔记' : 'AI 对话'}>
+        <div
+          className="drawer-resize-handle"
+          role="separator"
+          aria-label="调整面板宽度"
+          onPointerDown={startDrawerResize}
+          onPointerMove={moveDrawerResize}
+          onPointerUp={endDrawerResize}
+          onPointerCancel={endDrawerResize}
+          onLostPointerCapture={endDrawerResize}
+        />
         <div className="drawer-header">
           <h2>{drawerMode === 'annotations' ? '标注' : drawerMode === 'note' ? '笔记' : 'AI 对话'}</h2>
           <button type="button" className="drawer-close" onClick={() => setDrawerMode(null)} aria-label="关闭侧栏">关闭</button>
@@ -1644,36 +1728,81 @@ export function App() {
 
         {drawerMode === 'ai' ? (
           <>
-          <section className="session-queue" aria-labelledby="session-queue-title">
-            <div className="session-queue-header">
-              <h3 id="session-queue-title">最近 AI 对话</h3>
-              <span>{conversationSessions.length} / 10</span>
-            </div>
-            {conversationSessions.length > 0 ? (
-              <div className="session-list">
-                {conversationSessions.map((session) => (
-                  <button
-                    className={`session-item${session.conversationId === conversationId ? ' active' : ''}`}
-                    key={session.conversationId}
-                    type="button"
-                    onClick={() => void openConversationSession(session)}
-                    aria-current={session.conversationId === conversationId ? 'true' : undefined}
-                  >
-                    <span className="session-quote">{normalizeQuote(session.quote)}</span>
-                    <small>页 {session.pageIndex + 1} · {formatSessionTime(session.lastUsedAt)} · {session.status === 'running' ? '运行中' : '已暂停'}</small>
-                  </button>
-                ))}
+          <div className="ai-view-tabs" role="tablist" aria-label="AI 对话视图">
+            <button
+              type="button"
+              role="tab"
+              data-active={aiView === 'chat'}
+              className={`ai-view-tab${aiView === 'chat' ? ' active' : ''}`}
+              aria-selected={aiView === 'chat'}
+              onClick={() => setAiView('chat')}
+            >
+              对话
+            </button>
+            <button
+              type="button"
+              role="tab"
+              data-active={aiView === 'list'}
+              className={`ai-view-tab${aiView === 'list' ? ' active' : ''}`}
+              aria-selected={aiView === 'list'}
+              onClick={() => setAiView('list')}
+            >
+              会话
+            </button>
+          </div>
+          {aiView === 'list' ? (
+            <section className="session-queue" aria-labelledby="session-queue-title">
+              <div className="session-queue-header">
+                <h3 id="session-queue-title">最近 AI 对话</h3>
+                <span>{conversationSessions.length} / 10</span>
               </div>
-            ) : (
-              <p className="session-empty">当前文档还没有 AI 对话。</p>
-            )}
-          </section>
+              {conversationSessions.length > 0 ? (
+                <div className="session-list">
+                  {conversationSessions.map((session) => (
+                    <button
+                      className={`session-item${session.conversationId === conversationId ? ' active' : ''}`}
+                      key={session.conversationId}
+                      type="button"
+                      onClick={() => void openConversationSession(session)}
+                      aria-current={session.conversationId === conversationId ? 'true' : undefined}
+                    >
+                      <span className="session-quote">{normalizeQuote(session.quote)}</span>
+                      <small>页 {session.pageIndex + 1} · {formatSessionTime(session.lastUsedAt)} · {session.status === 'running' ? '运行中' : '已暂停'}</small>
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <p className="session-empty">当前文档还没有 AI 对话。</p>
+              )}
+            </section>
+          ) : (
+          <>
           {conversationQuote ? (
             <section className="quote-context">
               <p className="quote-context-label">对话引用</p>
-              <p>{normalizeQuote(conversationQuote)}</p>
-              {activeConversationContext?.kind === 'ephemeral-selection' ? <p className="anchor-meta">页 {activeConversationContext.selection.pageIndex + 1} · 临时选区</p> : null}
-              {activeConversationContext?.kind === 'saved-anchor' ? <p className="anchor-meta">已保存引用 · 新对话上下文</p> : null}
+              <div className="quote-context-meta">
+                {activeConversationContext?.kind === 'ephemeral-selection'
+                  ? `第 ${activeConversationContext.selection.pageIndex + 1} 页`
+                  : activeConversationContext?.kind === 'saved-anchor'
+                    ? `已保存引用`
+                    : null}
+                {typeof conversationQuote === 'string' && conversationQuote.length > 0
+                  ? ` · ${conversationQuote.length} 字`
+                  : null}
+              </div>
+              {quoteExpanded ? (
+                <p className="quote-context-full">{normalizeQuote(conversationQuote)}</p>
+              ) : (
+                <p className="quote-context-preview">{normalizeQuote(conversationQuote)}</p>
+              )}
+              <button
+                type="button"
+                className="quote-expand-toggle"
+                aria-expanded={quoteExpanded}
+                onClick={() => setQuoteExpanded((value) => !value)}
+              >
+                {quoteExpanded ? '收起' : '展开'}
+              </button>
             </section>
           ) : null}
           {conversation ? (
@@ -1682,10 +1811,12 @@ export function App() {
               {conversation?.messages.map((message: ConversationMessage) => (
                 <div className={`conversation-message ${message.role}`} key={message.id}>
                   <small>{message.role === 'user' ? '你' : message.role === 'assistant' ? 'AI' : message.toolName ?? '工具'}</small>
-                  <p>{message.content || '已完成工具调用'}</p>
+                  {message.role === 'assistant'
+                    ? <MarkdownContent source={message.content || ''} />
+                    : <p>{message.content || '已完成工具调用'}</p>}
                 </div>
               ))}
-              {assistantDraft ? <div className="conversation-message assistant streaming"><small>AI</small><p>{assistantDraft}</p></div> : null}
+              {assistantDraft ? <div className="conversation-message assistant streaming"><small>AI</small><MarkdownContent source={assistantDraft} /></div> : null}
               {!conversation && !conversationError ? <p className="annotation-empty">正在加载对话。</p> : null}
             </div>
             {toolStatus ? <p className="note-status">{toolStatus}</p> : null}
@@ -1735,6 +1866,8 @@ export function App() {
               {!aiSettings?.hasApiKey ? <p className="note-status error">保存安全 API Key 后即可开始对话。</p> : null}
               {conversationError ? <p className="note-status error">{conversationError}</p> : null}
             </section>
+          )}
+          </>
           )}
           </>
         ) : null}
