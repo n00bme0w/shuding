@@ -616,8 +616,11 @@ export function App() {
   const activateOpenedDocument = useCallback(async (document: OpenedDocument) => {
     setOpenedDocument(document);
     setRecentDocumentsError(null);
+    setDrawerMode(null);
+    setDrawerWidth(DRAWER_DEFAULT);
+    clearEphemeralConversationLocal();
     await refreshRecentDocuments();
-  }, [refreshRecentDocuments]);
+  }, [clearEphemeralConversationLocal, refreshRecentDocuments]);
 
   useEffect(() => {
     void refreshRecentDocuments();
