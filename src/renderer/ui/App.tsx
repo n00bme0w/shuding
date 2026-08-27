@@ -1,19 +1,54 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { getDocument, GlobalWorkerOptions, TextLayer, type PDFDocumentProxy, type PDFPageProxy } from 'pdfjs-dist';
 import { normalizeQuote } from '../../shared';
-import type { Anchor, Note, OpenedDocument, RecentDocument } from '../../shared';
+import type {
+  AiSettings,
+  Anchor,
+  ConversationEvent,
+  ConversationMessage,
+  ConversationSessionSummary,
+  ConversationSnapshot,
+  Note,
+  OpenedDocument,
+  PendingNoteProposal,
+  RecentDocument
+} from '../../shared';
 
 GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.mjs', import.meta.url).toString();
+
+type PageRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type NormalizedRect = PageRect;
 
 type PdfSelection = {
   quote: string;
   pageIndex: number;
-  pageRect: { x: number; y: number; width: number; height: number };
-  normalizedRect: { x: number; y: number; width: number; height: number };
+  pageRect: PageRect;
+  normalizedRect: NormalizedRect;
+  normalizedClientRects: NormalizedRect[];
 };
 
 type DraftSelection = PdfSelection & {
   documentId: string;
+};
+
+type DrawerMode = 'annotations' | 'note' | 'ai' | null;
+
+type SelectionActionPosition = {
+  left: number;
+  top: number;
+};
+
+type SelectionGeometry = {
+  pageIndex: number;
+  pageBounds: DOMRect;
+  selectedRect: DOMRect;
+  clientRects: DOMRect[];
 };
 
 const DEFAULT_SCALE = 1.5;
@@ -23,8 +58,116 @@ const ZOOM_STEP = 0.25;
 const PAGE_WINDOW_RADIUS = 3;
 const MAX_OUTPUT_SCALE = 2;
 const FALLBACK_PAGE_DIMENSIONS = { width: 612, height: 792 };
+const MIN_SELECTION_RECT_SIZE = 0.5;
+const SELECTION_LINE_TOLERANCE = 3;
+const SELECTION_MERGE_GAP = 6;
+const SELECTION_HORIZONTAL_PADDING = 1.5;
+const SELECTION_VERTICAL_PADDING = 1;
 
-function formatRecentOpenedAt(openedAt: string) {
+function clamp(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function getSelectionGeometry(selection: Selection): SelectionGeometry | null {
+  if (selection.rangeCount === 0 || selection.isCollapsed) {
+    return null;
+  }
+
+  const range = selection.getRangeAt(0);
+  const startElement = range.startContainer.nodeType === Node.ELEMENT_NODE
+    ? range.startContainer as Element
+    : range.startContainer.parentElement;
+  const pageWrapper = startElement?.closest<HTMLElement>('[data-page-index]');
+  if (!pageWrapper) {
+    return null;
+  }
+
+  const pageBounds = pageWrapper.getBoundingClientRect();
+  const selectedRect = range.getBoundingClientRect();
+  const clientRects = Array.from(range.getClientRects());
+  if (pageBounds.width <= 0 || pageBounds.height <= 0 || clientRects.length === 0) {
+    return null;
+  }
+
+  const pageIndex = Number(pageWrapper.dataset.pageIndex);
+  return Number.isInteger(pageIndex) ? { pageIndex, pageBounds, selectedRect, clientRects } : null;
+}
+
+function normalizeSelectionRects({ pageBounds, clientRects }: SelectionGeometry): NormalizedRect[] {
+  const clippedRects = clientRects.flatMap((clientRect) => {
+    const left = clamp(clientRect.left, pageBounds.left, pageBounds.right);
+    const top = clamp(clientRect.top, pageBounds.top, pageBounds.bottom);
+    const right = clamp(clientRect.right, pageBounds.left, pageBounds.right);
+    const bottom = clamp(clientRect.bottom, pageBounds.top, pageBounds.bottom);
+    const width = right - left;
+    const height = bottom - top;
+    if (width < MIN_SELECTION_RECT_SIZE || height < MIN_SELECTION_RECT_SIZE) {
+      return [];
+    }
+
+    return [{ left, top, right, bottom }];
+  });
+
+  const lines: Array<{ top: number; bottom: number; rects: typeof clippedRects }> = [];
+  for (const rect of clippedRects.sort((left, right) => left.top - right.top || left.left - right.left)) {
+    const line = lines.find((candidate) => (
+      Math.abs(candidate.top - rect.top) <= SELECTION_LINE_TOLERANCE &&
+      Math.abs(candidate.bottom - rect.bottom) <= SELECTION_LINE_TOLERANCE
+    ));
+    if (line) {
+      line.rects.push(rect);
+      line.top = Math.min(line.top, rect.top);
+      line.bottom = Math.max(line.bottom, rect.bottom);
+    } else {
+      lines.push({ top: rect.top, bottom: rect.bottom, rects: [rect] });
+    }
+  }
+
+  return lines.flatMap((line) => {
+    const bands: Array<{ left: number; top: number; right: number; bottom: number }> = [];
+    for (const rect of line.rects.sort((left, right) => left.left - right.left)) {
+      const previous = bands.at(-1);
+      if (previous && rect.left - previous.right <= SELECTION_MERGE_GAP) {
+        previous.right = Math.max(previous.right, rect.right);
+        previous.top = Math.min(previous.top, rect.top);
+        previous.bottom = Math.max(previous.bottom, rect.bottom);
+      } else {
+        bands.push({ ...rect });
+      }
+    }
+
+    return bands.map((band) => {
+      const left = clamp(band.left - SELECTION_HORIZONTAL_PADDING, pageBounds.left, pageBounds.right);
+      const top = clamp(band.top - SELECTION_VERTICAL_PADDING, pageBounds.top, pageBounds.bottom);
+      const right = clamp(band.right + SELECTION_HORIZONTAL_PADDING, pageBounds.left, pageBounds.right);
+      const bottom = clamp(band.bottom + SELECTION_VERTICAL_PADDING, pageBounds.top, pageBounds.bottom);
+      return {
+        x: (left - pageBounds.left) / pageBounds.width,
+        y: (top - pageBounds.top) / pageBounds.height,
+        width: (right - left) / pageBounds.width,
+        height: (bottom - top) / pageBounds.height
+      };
+    });
+  });
+}
+
+function hasSameSelectionPreview(
+  current: { pageIndex: number; rects: NormalizedRect[] } | null,
+  nextPageIndex: number,
+  nextRects: NormalizedRect[]
+) {
+  return current?.pageIndex === nextPageIndex &&
+    current.rects.length === nextRects.length &&
+    current.rects.every((rect, index) => {
+      const nextRect = nextRects[index];
+      return rect.x === nextRect.x &&
+        rect.y === nextRect.y &&
+        rect.width === nextRect.width &&
+        rect.height === nextRect.height;
+    });
+}
+
+  function formatRecentOpenedAt(openedAt: string) {
   const date = new Date(openedAt);
   if (Number.isNaN(date.getTime())) {
     return '打开时间未知';
@@ -34,6 +177,11 @@ function formatRecentOpenedAt(openedAt: string) {
     dateStyle: 'medium',
     timeStyle: 'short'
   }).format(date);
+}
+
+function formatSessionTime(lastUsedAt: string) {
+  const date = new Date(lastUsedAt);
+  return Number.isNaN(date.getTime()) ? '时间未知' : new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'short' }).format(date);
 }
 
 type PageDimensions = {
@@ -51,6 +199,7 @@ type PdfPageProps = {
   scrollRootRef: RefObject<HTMLElement | null>;
   anchors: Anchor[];
   activeAnchorId: string | null;
+  draftRects: NormalizedRect[];
   onVisible: (pageNumber: number) => void;
   onViewportChange: (pageIndex: number, isVisible: boolean) => void;
 };
@@ -99,6 +248,7 @@ function PdfPage({
   scrollRootRef,
   anchors,
   activeAnchorId,
+  draftRects,
   onVisible,
   onViewportChange
 }: PdfPageProps) {
@@ -237,6 +387,18 @@ function PdfPage({
         </>
       ) : null}
       <div className="anchor-overlay" aria-hidden="true">
+        {draftRects.map((rect, index) => (
+          <div
+            className="draft-highlight"
+            key={`draft-${index}`}
+            style={{
+              left: `${rect.x * 100}%`,
+              top: `${rect.y * 100}%`,
+              width: `${rect.width * 100}%`,
+              height: `${rect.height * 100}%`
+            }}
+          />
+        ))}
         {anchors.map((anchor) => (
           <div
             className={`anchor-highlight${anchor.id === activeAnchorId ? ' active' : ''}`}
@@ -268,6 +430,7 @@ export function App() {
   const [notesByAnchorId, setNotesByAnchorId] = useState<Record<string, Note[]>>({});
   const [activeAnchor, setActiveAnchor] = useState<Anchor | null>(null);
   const [draftSelection, setDraftSelection] = useState<DraftSelection | null>(null);
+  const [selectionPreview, setSelectionPreview] = useState<{ pageIndex: number; rects: NormalizedRect[] } | null>(null);
   const [noteBody, setNoteBody] = useState('');
   const [saving, setSaving] = useState(false);
   const [noteSaveError, setNoteSaveError] = useState<string | null>(null);
@@ -276,13 +439,120 @@ export function App() {
   const [recentDocuments, setRecentDocuments] = useState<RecentDocument[]>([]);
   const [recentDocumentsExpanded, setRecentDocumentsExpanded] = useState(false);
   const [recentDocumentsError, setRecentDocumentsError] = useState<string | null>(null);
+  const [aiSettings, setAiSettings] = useState<AiSettings | null>(null);
+  const [aiBaseUrl, setAiBaseUrl] = useState('');
+  const [aiModelId, setAiModelId] = useState('');
+  const [aiApiKey, setAiApiKey] = useState('');
+  const [savingAiSettings, setSavingAiSettings] = useState(false);
+  const [aiSettingsError, setAiSettingsError] = useState<string | null>(null);
+  const [conversation, setConversation] = useState<ConversationSnapshot | null>(null);
+  const [conversationId, setConversationId] = useState<string | null>(null);
+  const [activeConversationContext, setActiveConversationContext] = useState<ConversationSnapshot['context'] | null>(null);
+  const [conversationSessions, setConversationSessions] = useState<ConversationSessionSummary[]>([]);
+  const [conversationDraft, setConversationDraft] = useState('');
+  const [conversationRunning, setConversationRunning] = useState(false);
+  const [assistantDraft, setAssistantDraft] = useState('');
+  const [toolStatus, setToolStatus] = useState<string | null>(null);
+  const [conversationError, setConversationError] = useState<string | null>(null);
+  const [conversationNotice, setConversationNotice] = useState<string | null>(null);
+  const [pendingProposal, setPendingProposal] = useState<PendingNoteProposal | null>(null);
+  const [savingProposal, setSavingProposal] = useState(false);
+  const [ephemeralSummary, setEphemeralSummary] = useState('');
+  const [drawerMode, setDrawerMode] = useState<DrawerMode>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [selectionActionPosition, setSelectionActionPosition] = useState<SelectionActionPosition | null>(null);
+  const [selectionActionError, setSelectionActionError] = useState<string | null>(null);
   const outputScale = useOutputScale();
   const pageSurfaceRef = useRef<HTMLElement>(null);
   const openedDocumentRef = useRef<OpenedDocument | null>(null);
+  const settingsTriggerRef = useRef<HTMLButtonElement>(null);
+  const assistantDraftRef = useRef('');
+  const selectionPreviewFrameRef = useRef<number | null>(null);
+  const conversationIdRef = useRef<string | null>(null);
+  const conversationRunningRef = useRef(false);
+  const conversationRef = useRef<ConversationSnapshot | null>(null);
+  const conversationSnapshotsRef = useRef(new Map<string, ConversationSnapshot>());
+  const draftSelectionRef = useRef<DraftSelection | null>(null);
 
   useEffect(() => {
     openedDocumentRef.current = openedDocument;
   }, [openedDocument]);
+
+  useEffect(() => {
+    assistantDraftRef.current = assistantDraft;
+  }, [assistantDraft]);
+
+  useEffect(() => {
+    conversationIdRef.current = conversationId;
+  }, [conversationId]);
+
+  useEffect(() => {
+    conversationRef.current = conversation;
+    if (conversation) {
+      conversationSnapshotsRef.current.set(conversation.conversationId, conversation);
+    }
+  }, [conversation]);
+
+  useEffect(() => {
+    conversationRunningRef.current = conversationRunning;
+  }, [conversationRunning]);
+
+  useEffect(() => {
+    draftSelectionRef.current = draftSelection;
+  }, [draftSelection]);
+
+  const clearEphemeralConversationLocal = useCallback(() => {
+    conversationIdRef.current = null;
+    conversationRef.current = null;
+    conversationRunningRef.current = false;
+    setConversationId(null);
+    setConversation(null);
+    setActiveConversationContext(null);
+    setPendingProposal(null);
+    setAssistantDraft('');
+    setEphemeralSummary('');
+    setToolStatus(null);
+    setConversationError(null);
+    setConversationNotice(null);
+    setSelectionActionError(null);
+    setConversationRunning(false);
+    setConversationDraft('');
+  }, []);
+
+  const activateConversation = useCallback((snapshot: ConversationSnapshot, status: 'running' | 'idle' = 'idle') => {
+    conversationIdRef.current = snapshot.conversationId;
+    conversationRef.current = snapshot;
+    conversationSnapshotsRef.current.set(snapshot.conversationId, snapshot);
+    setConversation(snapshot);
+    setConversationId(snapshot.conversationId);
+    setActiveConversationContext(snapshot.context);
+    setConversationRunning(status === 'running');
+    setPendingProposal(snapshot.pendingProposal);
+    setAssistantDraft('');
+    setToolStatus(null);
+    setConversationError(null);
+    setConversationNotice(null);
+    setEphemeralSummary('');
+  }, []);
+
+  const refreshConversationSessions = useCallback(async (documentFingerprint = openedDocumentRef.current?.fingerprint) => {
+    if (!bridgeAvailable || !documentFingerprint) {
+      setConversationSessions([]);
+      return;
+    }
+
+    try {
+      setConversationSessions(await window.shuding.listConversationSessions({ documentFingerprint }));
+    } catch (error) {
+      console.error('Unable to load conversation sessions.', error);
+    }
+  }, [bridgeAvailable]);
+
+  useEffect(() => {
+    if (conversation?.context.kind !== 'ephemeral-selection' || !conversationId || !bridgeAvailable) return;
+    if (openedDocument?.fingerprint === conversation.context.selection.documentFingerprint) return;
+    clearEphemeralConversationLocal();
+  }, [bridgeAvailable, clearEphemeralConversationLocal, conversation, conversationId, openedDocument?.fingerprint]);
 
   const notesForAnchor = useCallback(
     (anchorId: string) => notesByAnchorId[anchorId] ?? [],
@@ -311,6 +581,146 @@ export function App() {
   useEffect(() => {
     void refreshRecentDocuments();
   }, [refreshRecentDocuments]);
+
+  useEffect(() => {
+    if (!bridgeAvailable) {
+      return;
+    }
+    void window.shuding.getAiSettings().then((settings) => {
+      setAiSettings(settings);
+      setAiBaseUrl(settings.baseUrl);
+      setAiModelId(settings.modelId);
+    }).catch((error: unknown) => {
+      console.error('Unable to load AI settings.', error);
+      setAiSettingsError('AI 设置暂时无法加载。');
+    });
+  }, [bridgeAvailable]);
+
+  useEffect(() => {
+    if (!bridgeAvailable) {
+      return;
+    }
+    return window.shuding.subscribeConversationEvents((event: ConversationEvent) => {
+      void refreshConversationSessions();
+      if (event.conversationId !== conversationIdRef.current) {
+        return;
+      }
+      if (event.type === 'status') {
+        setConversationRunning(event.status === 'running');
+        if (event.status === 'idle') {
+          setToolStatus(null);
+          void refreshConversationSessions();
+        }
+      } else if (event.type === 'assistant_delta') {
+        setAssistantDraft((current) => current + event.delta);
+      } else if (event.type === 'tool') {
+        setToolStatus(`${event.toolName}: ${event.status === 'running' ? '运行中' : event.status === 'completed' ? '完成' : '失败'}`);
+      } else if (event.type === 'proposal') {
+        setPendingProposal(event.proposal);
+      } else if (event.type === 'error') {
+        setConversationError(event.message);
+      }
+    });
+  }, [bridgeAvailable, refreshConversationSessions]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') {
+        return;
+      }
+      if (settingsOpen) {
+        setSettingsOpen(false);
+        window.setTimeout(() => settingsTriggerRef.current?.focus(), 0);
+        return;
+      }
+      if (drawerMode) {
+        setDrawerMode(null);
+        return;
+      }
+      setDraftSelection(null);
+      setSelectionActionPosition(null);
+      window.getSelection()?.removeAllRanges();
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [drawerMode, settingsOpen]);
+
+  useEffect(() => {
+    if (!pdf) {
+      return;
+    }
+
+    const updatePreview = () => {
+      if (selectionPreviewFrameRef.current !== null) {
+        return;
+      }
+      selectionPreviewFrameRef.current = window.requestAnimationFrame(() => {
+        selectionPreviewFrameRef.current = null;
+        const selection = window.getSelection();
+        const geometry = selection ? getSelectionGeometry(selection) : null;
+        if (!geometry) {
+          setSelectionPreview((current) => current ? null : current);
+          return;
+        }
+
+        const rects = normalizeSelectionRects(geometry);
+        setSelectionPreview((current) => hasSameSelectionPreview(current, geometry.pageIndex, rects)
+          ? current
+          : { pageIndex: geometry.pageIndex, rects });
+      });
+    };
+
+    document.addEventListener('selectionchange', updatePreview);
+    return () => {
+      document.removeEventListener('selectionchange', updatePreview);
+      if (selectionPreviewFrameRef.current !== null) {
+        window.cancelAnimationFrame(selectionPreviewFrameRef.current);
+        selectionPreviewFrameRef.current = null;
+      }
+    };
+  }, [pdf]);
+
+  useEffect(() => {
+    const onPointerDown = (event: PointerEvent) => {
+      if (!draftSelection || !(event.target instanceof Element)) {
+        return;
+      }
+      if (event.target.closest('.text-layer, .selection-action-bar, .drawer')) {
+        return;
+      }
+
+      setDraftSelection(null);
+      setSelectionPreview(null);
+      setSelectionActionPosition(null);
+      setSelectionActionError(null);
+      window.getSelection()?.removeAllRanges();
+    };
+
+    document.addEventListener('pointerdown', onPointerDown);
+    return () => document.removeEventListener('pointerdown', onPointerDown);
+  }, [draftSelection]);
+
+  useEffect(() => {
+    if (!activeAnchor || !bridgeAvailable) {
+      return;
+    }
+    let cancelled = false;
+    void window.shuding.openConversation({ kind: 'saved-anchor', anchorId: activeAnchor.id }).then((snapshot) => {
+      if (!cancelled) {
+        activateConversation(snapshot);
+        void refreshConversationSessions();
+      }
+    }).catch((error: unknown) => {
+      if (!cancelled) {
+        const details = error instanceof Error ? error.message : '未知错误';
+        setConversationError(`对话无法打开：${details}`);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeAnchor?.id, activateConversation, bridgeAvailable, refreshConversationSessions]);
 
   const activateAnchor = useCallback((anchor: Anchor, shouldScroll = true, note?: Note, draftBody?: string) => {
     setActiveAnchor(anchor);
@@ -348,6 +758,11 @@ export function App() {
   }, []);
 
   const summary = useMemo(() => normalizeQuote(selectionText), [selectionText]);
+  const conversationQuote = activeConversationContext?.kind === 'ephemeral-selection'
+    ? activeConversationContext.selection.quote
+    : activeConversationContext?.kind === 'saved-anchor'
+      ? anchors.find((anchor) => anchor.id === activeConversationContext.anchorId)?.quote ?? summary
+      : null;
   const pageRenderPriorities = useMemo(() => {
     const visiblePages = Array.from(visiblePageIndices);
     if (visiblePages.length === 0) {
@@ -391,52 +806,76 @@ export function App() {
     const onMouseUp = () => {
       const selection = window.getSelection();
       if (!selection || selection.isCollapsed) {
+        setDraftSelection(null);
+        setSelectionPreview(null);
+        setSelectionActionPosition(null);
         return;
       }
 
       const text = selection.toString().trim();
       if (!text) {
+        setDraftSelection(null);
+        setSelectionPreview(null);
+        setSelectionActionPosition(null);
         return;
       }
 
-      const range = selection.getRangeAt(0);
-      const startElement = range.startContainer.nodeType === Node.ELEMENT_NODE
-        ? range.startContainer as Element
-        : range.startContainer.parentElement;
-      const pageWrapper = startElement?.closest<HTMLElement>('[data-page-index]');
-      if (!pageWrapper) {
+      const geometry = getSelectionGeometry(selection);
+      if (!geometry) {
+        setSelectionPreview(null);
         return;
       }
 
-      const selectedRect = range.getBoundingClientRect();
-      const pageBounds = pageWrapper.getBoundingClientRect();
+      const { pageBounds, selectedRect } = geometry;
       const left = Math.max(selectedRect.left, pageBounds.left);
       const top = Math.max(selectedRect.top, pageBounds.top);
       const right = Math.min(selectedRect.right, pageBounds.right);
       const bottom = Math.min(selectedRect.bottom, pageBounds.bottom);
       if (right <= left || bottom <= top) {
+        setSelectionPreview(null);
         return;
       }
 
-      const pageRect = {
+      const pageRect: PageRect = {
         x: left - pageBounds.left,
         y: top - pageBounds.top,
         width: right - left,
         height: bottom - top
       };
 
-      const normalizedRect = {
+      const normalizedRect: NormalizedRect = {
         x: pageRect.x / Math.max(pageBounds.width, 1),
         y: pageRect.y / Math.max(pageBounds.height, 1),
         width: pageRect.width / Math.max(pageBounds.width, 1),
         height: pageRect.height / Math.max(pageBounds.height, 1)
       };
+      const normalizedClientRects = geometry.clientRects.flatMap((clientRect) => {
+        const clientLeft = Math.max(clientRect.left, pageBounds.left);
+        const clientTop = Math.max(clientRect.top, pageBounds.top);
+        const clientRight = Math.min(clientRect.right, pageBounds.right);
+        const clientBottom = Math.min(clientRect.bottom, pageBounds.bottom);
+        if (clientRight <= clientLeft || clientBottom <= clientTop) {
+          return [];
+        }
+
+        return [{
+          x: (clientLeft - pageBounds.left) / Math.max(pageBounds.width, 1),
+          y: (clientTop - pageBounds.top) / Math.max(pageBounds.height, 1),
+          width: (clientRight - clientLeft) / Math.max(pageBounds.width, 1),
+          height: (clientBottom - clientTop) / Math.max(pageBounds.height, 1)
+        }];
+      });
+      if (normalizedClientRects.length === 0) {
+        setSelectionPreview(null);
+        return;
+      }
 
       const nextSelection: PdfSelection = {
         quote: text,
-        pageIndex: Number(pageWrapper.dataset.pageIndex),
+        pageIndex: geometry.pageIndex,
         pageRect,
-        normalizedRect
+        normalizedRect,
+        normalizedClientRects
       };
 
       const documentId = openedDocumentRef.current?.fingerprint;
@@ -444,12 +883,19 @@ export function App() {
         return;
       }
 
-      setSelectionText(text);
-      setActiveAnchor(null);
-      setDraftSelection({ ...nextSelection, documentId });
-      setNoteBody('');
-      setNoteSaveError(null);
-      setNoteSaved(false);
+       setSelectionText(text);
+       setActiveAnchor(null);
+       draftSelectionRef.current = { ...nextSelection, documentId };
+       setDraftSelection({ ...nextSelection, documentId });
+       setSelectionPreview({ pageIndex: geometry.pageIndex, rects: normalizeSelectionRects(geometry) });
+       setNoteBody('');
+       setNoteSaveError(null);
+       setNoteSaved(false);
+       setSelectionActionError(null);
+       setSelectionActionPosition({
+         left: Math.min(Math.max(selectedRect.left + selectedRect.width / 2, 112), window.innerWidth - 112),
+         top: Math.max(selectedRect.top - 10, 12)
+       });
     };
 
     document.addEventListener('mouseup', onMouseUp);
@@ -466,10 +912,11 @@ export function App() {
       setScale(DEFAULT_SCALE);
        setAnchors([]);
        setNotesByAnchorId({});
-       setActiveAnchor(null);
-       setDraftSelection(null);
-       setNoteBody('');
-      return;
+        setActiveAnchor(null);
+        setDraftSelection(null);
+        setNoteBody('');
+        setSelectionActionPosition(null);
+       return;
     }
 
     let cancelled = false;
@@ -503,6 +950,14 @@ export function App() {
 
   useEffect(() => {
     if (!openedDocument) {
+      setConversationSessions([]);
+      return;
+    }
+    void refreshConversationSessions(openedDocument.fingerprint);
+  }, [openedDocument, refreshConversationSessions]);
+
+  useEffect(() => {
+    if (!openedDocument) {
       return;
     }
 
@@ -512,6 +967,7 @@ export function App() {
      setActiveAnchor(null);
      setDraftSelection(null);
      setNoteBody('');
+     setSelectionActionPosition(null);
 
     void (async () => {
       const loadedAnchors = await window.shuding.loadAnchors(openedDocument.fingerprint);
@@ -662,6 +1118,129 @@ export function App() {
     }
   }
 
+  async function askAiAboutDraft() {
+    if (!bridgeAvailable) {
+      setSelectionActionError('桌面桥接未加载，无法打开 AI 对话。');
+      return;
+    }
+    const selection = draftSelection;
+    const currentDocumentId = openedDocumentRef.current?.fingerprint;
+    if (!selection || !currentDocumentId || selection.documentId !== currentDocumentId) {
+      setSelectionActionError('所选文本已不属于当前文档。');
+      return;
+    }
+    const previousConversation = conversationRef.current;
+    const previousConversationId = conversationIdRef.current;
+    if (previousConversationId && previousConversation?.context.kind === 'ephemeral-selection' && conversationRunningRef.current) {
+      if (!window.confirm('停止当前 AI 对话并改问新选区？')) {
+        return;
+      }
+      try {
+        await window.shuding.discardConversation(previousConversationId);
+        conversationSnapshotsRef.current.delete(previousConversationId);
+        if (conversationIdRef.current === previousConversationId) {
+          clearEphemeralConversationLocal();
+        }
+        await refreshConversationSessions();
+      } catch (error: unknown) {
+        const details = error instanceof Error ? error.message : '未知错误';
+        setSelectionActionError(`临时对话清理失败：${details}`);
+        return;
+      }
+    }
+    if (openedDocumentRef.current?.fingerprint !== currentDocumentId) return;
+    setSelectionActionError(null);
+    setSelectionActionPosition(null);
+    setDrawerMode('ai');
+    try {
+      const snapshot = await window.shuding.openConversation({
+        kind: 'ephemeral-selection',
+        selection: {
+          documentFingerprint: selection.documentId,
+          pageIndex: selection.pageIndex,
+          quote: selection.quote,
+          normalizedQuote: normalizeQuote(selection.quote),
+          pageRect: selection.pageRect,
+          normalizedRect: selection.normalizedRect
+        }
+      });
+      if (openedDocumentRef.current?.fingerprint !== currentDocumentId) {
+        await window.shuding.discardConversation(snapshot.conversationId);
+        return;
+      }
+      activateConversation(snapshot);
+      await refreshConversationSessions();
+    } catch (error: unknown) {
+      const details = error instanceof Error ? error.message : '未知错误';
+      if (draftSelectionRef.current === selection) setConversationError(`对话无法打开：${details}`);
+    }
+  }
+
+  async function openConversationSession(session: ConversationSessionSummary) {
+    if (!bridgeAvailable || openedDocumentRef.current?.fingerprint !== session.documentFingerprint) return;
+    const cached = conversationSnapshotsRef.current.get(session.conversationId);
+    if (cached) {
+      activateConversation(cached, session.status);
+      setDrawerMode('ai');
+      return;
+    }
+
+    try {
+      const cachedContext = conversationSnapshotsRef.current.get(session.conversationId)?.context;
+      const savedAnchor = session.contextKind === 'saved-anchor'
+        ? anchors.find((anchor) => anchor.documentId === session.documentFingerprint && anchor.pageIndex === session.pageIndex && normalizeQuote(anchor.quote) === normalizeQuote(session.quote))
+        : null;
+      const context = cachedContext ?? (savedAnchor ? { kind: 'saved-anchor' as const, anchorId: savedAnchor.id } : null);
+      if (!context) {
+        setConversationError('该对话上下文暂时无法恢复。');
+        return;
+      }
+      if (session.contextKind === 'saved-anchor' && !savedAnchor) {
+        if (context.kind !== 'saved-anchor') {
+          setConversationError('该保存引用已不在当前文档中。');
+          return;
+        }
+      }
+      if (context.kind === 'ephemeral-selection' && context.selection.documentFingerprint !== session.documentFingerprint) {
+        setConversationError('该对话不属于当前文档。');
+        return;
+      }
+      const snapshot = await window.shuding.openConversation(context);
+      activateConversation(snapshot, session.status);
+      setDrawerMode('ai');
+      await refreshConversationSessions();
+    } catch (error: unknown) {
+      const details = error instanceof Error ? error.message : '未知错误';
+      setConversationError(`对话无法打开：${details}`);
+    }
+  }
+
+  async function copyDraftSelection() {
+    if (!draftSelection) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(draftSelection.quote);
+      setSelectionActionError(null);
+      setSelectionActionPosition(null);
+    } catch (error) {
+      console.error('Unable to copy selected text.', error);
+      setSelectionActionError('无法复制所选文本。');
+    }
+  }
+
+  function toggleDrawer(mode: Exclude<DrawerMode, null>) {
+    setDrawerMode((current) => current === mode ? null : mode);
+    if (mode === 'ai') {
+      void refreshConversationSessions();
+    }
+  }
+
+  function closeSettings() {
+    setSettingsOpen(false);
+    window.setTimeout(() => settingsTriggerRef.current?.focus(), 0);
+  }
+
   async function deleteCurrentAnchor(anchor: Anchor) {
     if (!window.confirm('删除这条标注及其笔记？')) {
       return;
@@ -685,8 +1264,177 @@ export function App() {
     }
   }
 
+  async function saveAiConfiguration() {
+    if (!bridgeAvailable) {
+      return;
+    }
+    setSavingAiSettings(true);
+    setAiSettingsError(null);
+    try {
+      const settings = await window.shuding.saveAiSettings({
+        baseUrl: aiBaseUrl,
+        modelId: aiModelId,
+        ...(aiApiKey ? { apiKey: aiApiKey } : {})
+      });
+      setAiSettings(settings);
+      setAiApiKey('');
+    } catch (error: unknown) {
+      const details = error instanceof Error ? error.message : '未知错误';
+      setAiSettingsError(`AI 设置保存失败：${details}`);
+    } finally {
+      setSavingAiSettings(false);
+    }
+  }
+
+  async function sendConversationMessage() {
+    if (!conversationId || !conversationDraft.trim() || conversationRunning || !bridgeAvailable) {
+      return;
+    }
+    const currentConversationId = conversationId;
+    const currentConversation = conversation;
+    const content = conversationDraft.trim();
+    setConversationDraft('');
+    setConversationError(null);
+    setAssistantDraft('');
+    setToolStatus(null);
+    setConversationRunning(true);
+    setConversation((current) => current ? {
+      ...current,
+      messages: [...current.messages, {
+        id: `pending-${Date.now()}`,
+        role: 'user',
+        content,
+        createdAt: new Date().toISOString()
+      }]
+    } : current);
+    try {
+      await window.shuding.sendConversationMessage({ conversationId: currentConversationId, content });
+      if (conversationIdRef.current !== currentConversationId) return;
+      if (currentConversation?.context.kind === 'saved-anchor') {
+        const snapshot = await window.shuding.openConversation(currentConversation.context);
+        if (conversationIdRef.current !== currentConversationId) return;
+        activateConversation(snapshot);
+      } else {
+        setConversation((current) => current ? {
+          ...current,
+          messages: [...current.messages, {
+            id: `completed-${Date.now()}`,
+            role: 'assistant',
+            content: assistantDraftRef.current,
+            createdAt: new Date().toISOString()
+          }]
+        } : current);
+      }
+      await refreshConversationSessions();
+      setAssistantDraft('');
+    } catch (error: unknown) {
+      const details = error instanceof Error ? error.message : '未知错误';
+      if (conversationIdRef.current === currentConversationId) setConversationError(`发送失败：${details}`);
+    } finally {
+      if (conversationIdRef.current === currentConversationId) setConversationRunning(false);
+    }
+  }
+
+  async function confirmProposal() {
+    if (!pendingProposal || !bridgeAvailable) {
+      return;
+    }
+    setSavingProposal(true);
+    setConversationError(null);
+    try {
+      const savedNote = await window.shuding.confirmNoteProposal({
+        conversationId: pendingProposal.conversationId,
+        proposalId: pendingProposal.id
+      });
+      setNotesByAnchorId((current) => ({
+        ...current,
+        [savedNote.anchorId]: [...(current[savedNote.anchorId] ?? []), savedNote]
+      }));
+      setPendingProposal(null);
+      void refreshConversationSessions();
+    } catch (error: unknown) {
+      const details = error instanceof Error ? error.message : '未知错误';
+      setConversationError(`保存建议失败：${details}`);
+    } finally {
+      setSavingProposal(false);
+    }
+  }
+
+  async function discardProposal() {
+    if (!pendingProposal || !bridgeAvailable) {
+      return;
+    }
+    try {
+      await window.shuding.discardNoteProposal(pendingProposal.id);
+      setPendingProposal(null);
+      void refreshConversationSessions();
+    } catch (error: unknown) {
+      const details = error instanceof Error ? error.message : '未知错误';
+      setConversationError(`丢弃建议失败：${details}`);
+    }
+  }
+
+  async function finalizeEphemeral(saveSummary: boolean) {
+    if (!conversationId || conversation?.context.kind !== 'ephemeral-selection' || !bridgeAvailable) return;
+    const currentConversationId = conversationId;
+    const documentFingerprint = openedDocumentRef.current?.fingerprint;
+    if (!documentFingerprint || documentFingerprint !== conversation.context.selection.documentFingerprint) {
+      setConversationError('当前文档已更改，无法保存临时对话引用。');
+      return;
+    }
+    const body = saveSummary ? (ephemeralSummary.trim() || pendingProposal?.body) : undefined;
+    if (saveSummary && !body) {
+      setConversationError('请输入或先生成要保存的笔记摘要。');
+      return;
+    }
+    setSavingProposal(true);
+    setConversationError(null);
+    try {
+      const result = await window.shuding.finalizeEphemeral({
+        conversationId: currentConversationId,
+        documentFingerprint,
+        ...(saveSummary ? { body, proposalId: pendingProposal?.id } : {})
+      });
+      if (conversationIdRef.current !== currentConversationId || openedDocumentRef.current?.fingerprint !== documentFingerprint) return;
+      setAnchors((current) => [...current, result.anchor]);
+      if (result.note) {
+        setNotesByAnchorId((current) => ({ ...current, [result.note!.anchorId]: [...(current[result.note!.anchorId] ?? []), result.note!] }));
+      }
+      setActiveAnchor(result.anchor);
+      setSelectionText(result.anchor.quote);
+      setDraftSelection(null);
+      setSelectionActionPosition(null);
+      clearEphemeralConversationLocal();
+      setConversationNotice('临时对话未保存到引用历史；已保存的引用可继续开始新对话。');
+      void refreshConversationSessions();
+    } catch (error: unknown) {
+      const details = error instanceof Error ? error.message : '未知错误';
+      if (conversationIdRef.current === currentConversationId) setConversationError(`保存临时对话失败：${details}`);
+    } finally {
+      if (conversationIdRef.current === currentConversationId) setSavingProposal(false);
+    }
+  }
+
+  async function discardEphemeralConversation() {
+    if (!conversationId || conversation?.context.kind !== 'ephemeral-selection' || !bridgeAvailable) return;
+    const currentConversationId = conversationId;
+    clearEphemeralConversationLocal();
+    setDrawerMode(null);
+    try {
+      await window.shuding.discardConversation(currentConversationId);
+      conversationSnapshotsRef.current.delete(currentConversationId);
+      await refreshConversationSessions();
+      if (!draftSelectionRef.current) {
+        setSelectionText('选中一句话后在这里生成锚点');
+      }
+    } catch (error: unknown) {
+      const details = error instanceof Error ? error.message : '未知错误';
+      setSelectionActionError(`临时对话清理失败：${details}`);
+    }
+  }
+
   return (
-    <div className="shell">
+    <div className={`shell${drawerMode ? ' drawer-open' : ''}`}>
       <aside className="sidebar">
         <div>
           <div className="brand">书钉</div>
@@ -731,7 +1479,6 @@ export function App() {
               )}
             </section>
           ) : null}
-          <button className="ghost" type="button">笔记</button>
         </div>
       </aside>
 
@@ -742,6 +1489,41 @@ export function App() {
             <div className="doc-meta">{pageCount > 0 ? `第 ${currentPage} / ${pageCount} 页` : '等待导入 PDF'}</div>
           </div>
           <div className="topbar-actions">
+            <div className="drawer-controls" aria-label="阅读工具">
+              <button
+                type="button"
+                aria-expanded={drawerMode === 'annotations'}
+                aria-controls="contextual-drawer"
+                onClick={() => toggleDrawer('annotations')}
+              >
+                标注
+              </button>
+              <button
+                type="button"
+                aria-expanded={drawerMode === 'note'}
+                aria-controls="contextual-drawer"
+                onClick={() => toggleDrawer('note')}
+              >
+                笔记
+              </button>
+              <button
+                type="button"
+                aria-expanded={drawerMode === 'ai'}
+                aria-controls="contextual-drawer"
+                onClick={() => toggleDrawer('ai')}
+              >
+                AI
+              </button>
+              <button
+                ref={settingsTriggerRef}
+                type="button"
+                aria-haspopup="dialog"
+                aria-expanded={settingsOpen}
+                onClick={() => setSettingsOpen(true)}
+              >
+                设置
+              </button>
+            </div>
             <div className="zoom-controls" aria-label="缩放控制">
               <button type="button" aria-label="缩小" onClick={() => setScale((value) => Math.max(MIN_SCALE, value - ZOOM_STEP))} disabled={!pdf || scale <= MIN_SCALE}>-</button>
               <button type="button" className="zoom-reset" onClick={() => setScale(DEFAULT_SCALE)} disabled={!pdf || scale === DEFAULT_SCALE}>{Math.round(scale * 100)}%</button>
@@ -768,7 +1550,12 @@ export function App() {
                   renderPriority={pageRenderPriorities.get(pageIndex)}
                   scrollRootRef={pageSurfaceRef}
                   anchors={anchors.filter((anchor) => anchor.pageIndex === pageIndex)}
-                  activeAnchorId={activeAnchor?.id ?? null}
+                   activeAnchorId={activeAnchor?.id ?? null}
+                   draftRects={selectionPreview?.pageIndex === pageIndex
+                     ? selectionPreview.rects
+                     : draftSelection?.pageIndex === pageIndex
+                       ? draftSelection.normalizedClientRects
+                       : []}
                   onVisible={setCurrentPage}
                   onViewportChange={onViewportChange}
                 />
@@ -778,16 +1565,15 @@ export function App() {
         </section>
       </main>
 
-      <aside className="inspector">
-        {!bridgeAvailable ? <div className="bridge-error">桌面桥接未加载，笔记无法保存。请完全重启应用。</div> : null}
-        <div className="panel">
-          <h2>引用</h2>
-          <p>{summary}</p>
-          {activeAnchor ? <p className="anchor-meta">页 {activeAnchor.pageIndex + 1} · {activeAnchor.kind}</p> : null}
+      {drawerMode ? (
+      <aside className="drawer" id="contextual-drawer" aria-label={drawerMode === 'annotations' ? '标注' : drawerMode === 'note' ? '笔记' : 'AI 对话'}>
+        <div className="drawer-header">
+          <h2>{drawerMode === 'annotations' ? '标注' : drawerMode === 'note' ? '笔记' : 'AI 对话'}</h2>
+          <button type="button" className="drawer-close" onClick={() => setDrawerMode(null)} aria-label="关闭侧栏">关闭</button>
         </div>
-
-        <div className="panel">
-          <h2>标注</h2>
+        {!bridgeAvailable ? <div className="bridge-error">桌面桥接未加载，笔记无法保存。请完全重启应用。</div> : null}
+        {drawerMode === 'annotations' ? (
+          <section className="drawer-section">
           <div className="annotation-list">
           {anchors.map((anchor) => {
               const anchorNotes = notesForAnchor(anchor.id);
@@ -821,18 +1607,182 @@ export function App() {
             })}
             {openedDocument && anchors.length === 0 ? <p className="annotation-empty">此文档还没有标注。</p> : null}
           </div>
-        </div>
+          </section>
+        ) : null}
 
-        <div className="panel">
-          <h2>笔记</h2>
+        {drawerMode === 'note' ? (
+          <>
+          {(activeAnchor || draftSelection) ? (
+            <section className="quote-context">
+              <p className="quote-context-label">当前引用</p>
+              <p>{summary}</p>
+              {activeAnchor ? <p className="anchor-meta">页 {activeAnchor.pageIndex + 1} · {activeAnchor.kind}</p> : null}
+            </section>
+          ) : null}
+          <section className="drawer-section note-composer">
+          <h3>手动笔记</h3>
           <textarea value={noteBody} onChange={(event) => setNoteBody(event.target.value)} placeholder="在这里记录这一段的想法" />
           <button className="primary full" onClick={() => void saveCurrentNote()} disabled={(!activeAnchor && !draftSelection) || !noteBody.trim() || saving}>
             {saving ? '保存中' : '保存笔记'}
           </button>
           {noteSaveError ? <p className="note-status error">{noteSaveError}</p> : null}
           {noteSaved ? <p className="note-status">已保存</p> : null}
-        </div>
+          {activeAnchor ? (
+            <div className="saved-notes">
+              <h3>已保存笔记</h3>
+              {notesForAnchor(activeAnchor.id).map((note) => (
+                <button className="annotation-note" key={note.id} type="button" onClick={() => activateAnchor(activeAnchor, false, note)}>
+                  {note.body}
+                </button>
+              ))}
+              {notesForAnchor(activeAnchor.id).length === 0 ? <p className="annotation-empty">当前引用还没有手动笔记。</p> : null}
+            </div>
+          ) : null}
+          </section>
+          </>
+        ) : null}
+
+        {drawerMode === 'ai' ? (
+          <>
+          <section className="session-queue" aria-labelledby="session-queue-title">
+            <div className="session-queue-header">
+              <h3 id="session-queue-title">最近 AI 对话</h3>
+              <span>{conversationSessions.length} / 10</span>
+            </div>
+            {conversationSessions.length > 0 ? (
+              <div className="session-list">
+                {conversationSessions.map((session) => (
+                  <button
+                    className={`session-item${session.conversationId === conversationId ? ' active' : ''}`}
+                    key={session.conversationId}
+                    type="button"
+                    onClick={() => void openConversationSession(session)}
+                    aria-current={session.conversationId === conversationId ? 'true' : undefined}
+                  >
+                    <span className="session-quote">{normalizeQuote(session.quote)}</span>
+                    <small>页 {session.pageIndex + 1} · {formatSessionTime(session.lastUsedAt)} · {session.status === 'running' ? '运行中' : '已暂停'}</small>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <p className="session-empty">当前文档还没有 AI 对话。</p>
+            )}
+          </section>
+          {conversationQuote ? (
+            <section className="quote-context">
+              <p className="quote-context-label">对话引用</p>
+              <p>{normalizeQuote(conversationQuote)}</p>
+              {activeConversationContext?.kind === 'ephemeral-selection' ? <p className="anchor-meta">页 {activeConversationContext.selection.pageIndex + 1} · 临时选区</p> : null}
+              {activeConversationContext?.kind === 'saved-anchor' ? <p className="anchor-meta">已保存引用 · 新对话上下文</p> : null}
+            </section>
+          ) : null}
+          {conversation ? (
+          <section className="drawer-section conversation-panel">
+            <div className="conversation-messages" aria-live="polite">
+              {conversation?.messages.map((message: ConversationMessage) => (
+                <div className={`conversation-message ${message.role}`} key={message.id}>
+                  <small>{message.role === 'user' ? '你' : message.role === 'assistant' ? 'AI' : message.toolName ?? '工具'}</small>
+                  <p>{message.content || '已完成工具调用'}</p>
+                </div>
+              ))}
+              {assistantDraft ? <div className="conversation-message assistant streaming"><small>AI</small><p>{assistantDraft}</p></div> : null}
+              {!conversation && !conversationError ? <p className="annotation-empty">正在加载对话。</p> : null}
+            </div>
+            {toolStatus ? <p className="note-status">{toolStatus}</p> : null}
+            {conversationNotice ? <p className="note-status">{conversationNotice}</p> : null}
+            <textarea value={conversationDraft} onChange={(event) => setConversationDraft(event.target.value)} placeholder="围绕当前引用提问" disabled={conversationRunning} />
+            <div className="conversation-actions">
+              <button className="primary" type="button" onClick={() => void sendConversationMessage()} disabled={conversationRunning || !conversationDraft.trim() || !aiSettings?.hasApiKey}>
+                发送
+              </button>
+              <button type="button" onClick={() => conversationId && void window.shuding.abortConversation(conversationId)} disabled={!conversationRunning}>
+                停止
+              </button>
+            </div>
+            {!aiSettings?.hasApiKey ? <p className="note-status error">保存安全 API Key 后即可开始对话。</p> : null}
+            {conversationError ? <p className="note-status error">{conversationError}</p> : null}
+            {pendingProposal ? (
+              <div className="proposal-preview">
+                <h3>AI 笔记建议</h3>
+             {conversation.context.kind === 'ephemeral-selection' ? (
+                  <textarea value={ephemeralSummary} onChange={(event) => setEphemeralSummary(event.target.value)} placeholder={pendingProposal.body} />
+                ) : <p>{pendingProposal.body}</p>}
+                <div className="conversation-actions">
+                  {conversation.context.kind === 'ephemeral-selection' ? (
+                    <button className="primary" type="button" onClick={() => void finalizeEphemeral(true)} disabled={savingProposal}>
+                      {savingProposal ? '保存中' : '保存摘要为笔记'}
+                    </button>
+                  ) : (
+                    <button className="primary" type="button" onClick={() => void confirmProposal()} disabled={savingProposal}>
+                      {savingProposal ? '保存中' : '保存为笔记'}
+                    </button>
+                  )}
+                  <button type="button" onClick={() => void discardProposal()} disabled={savingProposal}>丢弃</button>
+                </div>
+              </div>
+            ) : null}
+            {conversation.context.kind === 'ephemeral-selection' ? (
+              <div className="conversation-actions ephemeral-actions">
+                <button type="button" onClick={() => void finalizeEphemeral(false)} disabled={conversationRunning || savingProposal}>保存引用</button>
+                <button type="button" onClick={() => void finalizeEphemeral(true)} disabled={conversationRunning || savingProposal || (!ephemeralSummary.trim() && !pendingProposal)}>保存摘要为笔记</button>
+                <button type="button" onClick={() => void discardEphemeralConversation()} disabled={conversationRunning || savingProposal}>丢弃</button>
+              </div>
+            ) : null}
+          </section>
+          ) : (
+            <section className="drawer-section ai-empty-state">
+              <p>先选中一段文字并使用“Ask AI”，或从标注中选择已保存引用。</p>
+              {!aiSettings?.hasApiKey ? <p className="note-status error">保存安全 API Key 后即可开始对话。</p> : null}
+              {conversationError ? <p className="note-status error">{conversationError}</p> : null}
+            </section>
+          )}
+          </>
+        ) : null}
       </aside>
+      ) : null}
+      {selectionActionPosition && draftSelection ? (
+        <div
+          className="selection-action-bar"
+          style={{ left: selectionActionPosition.left, top: selectionActionPosition.top }}
+          onMouseDown={(event) => event.preventDefault()}
+          role="toolbar"
+          aria-label="所选文本操作"
+        >
+          <button type="button" onClick={() => { setDrawerMode('note'); setSelectionActionPosition(null); }}>添加笔记</button>
+          <button type="button" onClick={() => void askAiAboutDraft()}>Ask AI</button>
+          <button type="button" onClick={() => void copyDraftSelection()}>复制</button>
+        </div>
+      ) : null}
+      {selectionActionError ? <p className="selection-action-error" role="status">{selectionActionError}</p> : null}
+      {settingsOpen ? (
+        <div className="settings-backdrop" role="presentation" onMouseDown={closeSettings}>
+          <section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="modal-header">
+              <h2 id="settings-title">AI 设置</h2>
+              <button type="button" className="drawer-close" onClick={closeSettings} aria-label="关闭 AI 设置">关闭</button>
+            </div>
+            <div className="ai-settings-panel">
+              <label>
+                Base URL
+                <input value={aiBaseUrl} onChange={(event) => setAiBaseUrl(event.target.value)} placeholder="https://api.example.com/v1" />
+              </label>
+              <label>
+                模型 ID
+                <input value={aiModelId} onChange={(event) => setAiModelId(event.target.value)} placeholder="gpt-4o-mini" />
+              </label>
+              <label>
+                API Key
+                <input type="password" value={aiApiKey} onChange={(event) => setAiApiKey(event.target.value)} placeholder={aiSettings?.hasApiKey ? '已安全保存；留空保持不变' : '仅保存在安全存储中'} />
+              </label>
+              <button className="primary full" type="button" onClick={() => void saveAiConfiguration()} disabled={savingAiSettings || !aiBaseUrl.trim() || !aiModelId.trim()}>
+                {savingAiSettings ? '保存中' : '保存 AI 设置'}
+              </button>
+              {!aiSettings?.keyStorageAvailable ? <p className="note-status error">安全凭据存储不可用（{aiSettings?.keyStorageBackend ?? 'unknown'}）。Base URL 和模型会保存，但 API Key 不会保存。</p> : null}
+              {aiSettingsError ? <p className="note-status error">{aiSettingsError}</p> : null}
+            </div>
+          </section>
+        </div>
+      ) : null}
     </div>
   );
 }

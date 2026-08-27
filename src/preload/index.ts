@@ -2,12 +2,34 @@ import { contextBridge, ipcRenderer } from 'electron';
 import type {
   Anchor,
   AnchorDraft,
+  AiSettings,
+  ConfirmNoteProposalInput,
+  ConversationEvent,
+  ConversationSessionSummary,
+  ConversationSnapshot,
+  FinalizeEphemeralInput,
+  FinalizeEphemeralResult,
+  OpenConversationInput,
+  ListConversationSessionsInput,
   DeleteAnchorInput,
   Note,
   OpenedDocument,
   RecentDocument,
-  SaveNoteInput
+  SaveAiSettingsInput,
+  SaveNoteInput,
+  SendConversationInput
 } from '../shared';
+
+const conversationListeners = new Set<(event: ConversationEvent) => void>();
+
+ipcRenderer.on('conversation:event', (_event, payload: unknown) => {
+  if (typeof payload !== 'object' || payload === null || !('type' in payload) || !('conversationId' in payload)) {
+    return;
+  }
+  for (const listener of conversationListeners) {
+    listener(payload as ConversationEvent);
+  }
+});
 
 contextBridge.exposeInMainWorld('shuding', {
   version: '0.1.0',
@@ -21,7 +43,32 @@ contextBridge.exposeInMainWorld('shuding', {
   loadAnchors: (documentId: string) =>
     ipcRenderer.invoke('anchor:list-by-document', documentId) as Promise<Anchor[]>,
   loadNotes: (anchorIds: string[]) =>
-    ipcRenderer.invoke('note:list-by-anchor-ids', anchorIds) as Promise<Note[]>
+    ipcRenderer.invoke('note:list-by-anchor-ids', anchorIds) as Promise<Note[]>,
+  getAiSettings: () => ipcRenderer.invoke('ai:settings-get') as Promise<AiSettings>,
+  saveAiSettings: (input: SaveAiSettingsInput) =>
+    ipcRenderer.invoke('ai:settings-save', input) as Promise<AiSettings>,
+  openConversation: (context: OpenConversationInput) =>
+    ipcRenderer.invoke('conversation:open', context) as Promise<ConversationSnapshot>,
+  listConversationSessions: (input: ListConversationSessionsInput) =>
+    ipcRenderer.invoke('conversation:list-by-document', input) as Promise<ConversationSessionSummary[]>,
+  sendConversationMessage: (input: SendConversationInput) =>
+    ipcRenderer.invoke('conversation:send', input) as Promise<void>,
+  abortConversation: (conversationId: string) =>
+    ipcRenderer.invoke('conversation:abort', conversationId) as Promise<void>,
+  abandonEphemeralConversation: (conversationId: string) =>
+    ipcRenderer.invoke('conversation:abandon-ephemeral', conversationId) as Promise<void>,
+  confirmNoteProposal: (input: ConfirmNoteProposalInput) =>
+    ipcRenderer.invoke('conversation:confirm-note', input) as Promise<Note>,
+  discardNoteProposal: (proposalId: string) =>
+    ipcRenderer.invoke('conversation:discard-note', proposalId) as Promise<void>,
+  finalizeEphemeral: (input: FinalizeEphemeralInput) =>
+    ipcRenderer.invoke('conversation:finalize-ephemeral', input) as Promise<FinalizeEphemeralResult>,
+  discardConversation: (conversationId: string) =>
+    ipcRenderer.invoke('conversation:discard', conversationId) as Promise<void>,
+  subscribeConversationEvents: (listener: (event: ConversationEvent) => void) => {
+    conversationListeners.add(listener);
+    return () => conversationListeners.delete(listener);
+  }
 });
 
 export type ShudingApi = {
@@ -34,6 +81,18 @@ export type ShudingApi = {
   deleteAnchor(input: DeleteAnchorInput): Promise<void>;
   loadAnchors(documentId: string): Promise<Anchor[]>;
   loadNotes(anchorIds: string[]): Promise<Note[]>;
+  getAiSettings(): Promise<AiSettings>;
+  saveAiSettings(input: SaveAiSettingsInput): Promise<AiSettings>;
+  openConversation(context: OpenConversationInput): Promise<ConversationSnapshot>;
+  listConversationSessions(input: ListConversationSessionsInput): Promise<ConversationSessionSummary[]>;
+  sendConversationMessage(input: SendConversationInput): Promise<void>;
+  abortConversation(conversationId: string): Promise<void>;
+  abandonEphemeralConversation(conversationId: string): Promise<void>;
+  confirmNoteProposal(input: ConfirmNoteProposalInput): Promise<Note>;
+  discardNoteProposal(proposalId: string): Promise<void>;
+  finalizeEphemeral(input: FinalizeEphemeralInput): Promise<FinalizeEphemeralResult>;
+  discardConversation(conversationId: string): Promise<void>;
+  subscribeConversationEvents(listener: (event: ConversationEvent) => void): () => void;
 };
 
 declare global {

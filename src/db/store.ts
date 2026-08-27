@@ -16,6 +16,10 @@ function getDb() {
   db = new Database(file);
   db.exec(`
     pragma foreign_keys = on;
+    create table if not exists schemaMigrations (
+      version integer primary key,
+      appliedAt text not null
+    );
     create table if not exists anchors (
       id text primary key,
       documentId text not null,
@@ -45,13 +49,57 @@ function getDb() {
     );
     create index if not exists recentDocuments_openedAt_idx on recentDocuments (openedAt desc);
   `);
+  migrate(db);
 
   return db;
 }
 
-type StoredRecentDocument = Omit<RecentDocument, 'unavailable'>;
+function migrate(database: Database.Database) {
+  const alreadyApplied = database
+    .prepare('select version from schemaMigrations where version = @version')
+    .get({ version: 1 }) as { version: number } | undefined;
+  if (alreadyApplied) {
+    return;
+  }
 
-export function upsertRecentDocument(document: Omit<RecentDocument, 'openedAt' | 'unavailable' | 'id'>) {
+  database.transaction(() => {
+    database.exec(`
+      create table if not exists aiSettings (
+        id integer primary key check (id = 1),
+        baseUrl text not null,
+        modelId text not null,
+        encryptedApiKey text,
+        updatedAt text not null
+      );
+      create table if not exists conversations (
+        id text primary key,
+        anchorId text not null unique references anchors(id) on delete cascade,
+        createdAt text not null,
+        updatedAt text not null
+      );
+      create table if not exists conversationMessages (
+        id text primary key,
+        conversationId text not null references conversations(id) on delete cascade,
+        role text not null check (role in ('user', 'assistant', 'toolResult')),
+        content text not null,
+        toolName text,
+        createdAt text not null,
+        payload text not null
+      );
+      create index if not exists conversationMessages_conversationId_createdAt_idx
+        on conversationMessages (conversationId, createdAt);
+    `);
+    database.prepare(
+      'insert into schemaMigrations (version, appliedAt) values (@version, @appliedAt)'
+    ).run({ version: 1, appliedAt: new Date().toISOString() });
+  })();
+}
+
+type StoredRecentDocument = Omit<RecentDocument, 'unavailable'> & {
+  path: string;
+};
+
+export function upsertRecentDocument(document: Omit<StoredRecentDocument, 'openedAt' | 'id'>) {
   const database = getDb();
   const openedAt = new Date().toISOString();
   const id = randomUUID();
@@ -85,7 +133,13 @@ export function upsertRecentDocument(document: Omit<RecentDocument, 'openedAt' |
     ).run({ id, ...document, openedAt });
   })();
 
-  return getRecentDocumentByFingerprint(document.fingerprint);
+  const saved = getRecentDocumentByFingerprint(document.fingerprint);
+  return withoutPath(saved);
+}
+
+function withoutPath(document: StoredRecentDocument): RecentDocument {
+  const { path: _path, ...safeDocument } = document;
+  return safeDocument;
 }
 
 export function listRecentDocuments(limit: number): RecentDocument[] {
@@ -99,10 +153,10 @@ export function listRecentDocuments(limit: number): RecentDocument[] {
        limit @limit`
     )
     .all({ limit: boundedLimit }) as StoredRecentDocument[];
-  return rows;
+  return rows.map(withoutPath);
 }
 
-export function getRecentDocumentById(id: string): RecentDocument | null {
+export function getRecentDocumentById(id: string): StoredRecentDocument | null {
   const database = getDb();
   const row = database
     .prepare(
@@ -114,7 +168,7 @@ export function getRecentDocumentById(id: string): RecentDocument | null {
   return row ?? null;
 }
 
-function getRecentDocumentByFingerprint(fingerprint: string): RecentDocument {
+function getRecentDocumentByFingerprint(fingerprint: string): StoredRecentDocument {
   const database = getDb();
   const row = database
     .prepare(
@@ -201,6 +255,18 @@ export function getAnchorsByDocumentId(documentId: string): Anchor[] {
   return rows.map(hydrateAnchor);
 }
 
+export function getAnchorById(anchorId: string): Anchor | null {
+  const database = getDb();
+  const row = database
+    .prepare(
+      `select id, documentId, pageIndex, kind, quote, normalizedQuote, pageRect, normalizedRect, confidence, createdAt, updatedAt
+       from anchors
+       where id = @anchorId`
+    )
+    .get({ anchorId }) as StoredAnchor | undefined;
+  return row ? hydrateAnchor(row) : null;
+}
+
 export function createAnchor(draft: AnchorDraft): Anchor {
   const now = new Date().toISOString();
   return {
@@ -248,4 +314,30 @@ export function getNotesByAnchorIds(anchorIds: string[]): Note[] {
        order by createdAt asc`
     )
     .all(parameters) as Note[];
+}
+
+export type StoredAiSettings = {
+  baseUrl: string;
+  modelId: string;
+  encryptedApiKey: string | null;
+};
+
+export function getAiSettings(): StoredAiSettings | null {
+  const database = getDb();
+  return (database.prepare(
+    'select baseUrl, modelId, encryptedApiKey from aiSettings where id = 1'
+  ).get() as StoredAiSettings | undefined) ?? null;
+}
+
+export function saveAiSettings(settings: StoredAiSettings) {
+  const database = getDb();
+  database.prepare(
+    `insert into aiSettings (id, baseUrl, modelId, encryptedApiKey, updatedAt)
+     values (1, @baseUrl, @modelId, @encryptedApiKey, @updatedAt)
+     on conflict(id) do update set
+       baseUrl = excluded.baseUrl,
+       modelId = excluded.modelId,
+       encryptedApiKey = excluded.encryptedApiKey,
+       updatedAt = excluded.updatedAt`
+  ).run({ ...settings, updatedAt: new Date().toISOString() });
 }

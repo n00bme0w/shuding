@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, type IpcMainInvokeEvent, type WebContents } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs/promises';
@@ -14,9 +14,39 @@ import {
   saveNote,
   upsertRecentDocument
 } from '../db/store';
-import type { AnchorDraft, DeleteAnchorInput, OpenedDocument, SaveNoteInput } from '../shared';
+import {
+  abandonEphemeralConversation,
+  abortConversation,
+  confirmNoteProposal,
+  discardConversation,
+  discardNoteProposal,
+  finalizeEphemeral,
+  getSettings,
+  listConversationSessions,
+  openConversation,
+  removeConversationOwner,
+  saveSettings,
+  sendConversationMessage
+} from './ai/service';
+import type {
+  AnchorDraft,
+  ConfirmNoteProposalInput,
+  ConversationContext,
+  ConversationEvent,
+  DeleteAnchorInput,
+  FinalizeEphemeralInput,
+  ListConversationSessionsInput,
+  OpenedDocument,
+  SaveAiSettingsInput,
+  SaveNoteInput,
+  SendConversationInput
+} from '../shared';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+if (process.platform === 'linux' && !process.argv.some((argument) => argument.startsWith('--password-store='))) {
+  app.commandLine.appendSwitch('password-store', 'gnome-libsecret');
+}
 
 function createWindow() {
   process.env.FONTCONFIG_FILE = path.join(process.cwd(), 'fontconfig', 'fonts.conf');
@@ -38,6 +68,26 @@ function createWindow() {
   } else {
     void win.loadFile(path.join(__dirname, '../renderer/index.html'));
   }
+  win.webContents.once('destroyed', () => removeConversationOwner(win.webContents.id));
+}
+
+function assertTrustedSender(event: IpcMainInvokeEvent) {
+  const owner = BrowserWindow.fromWebContents(event.sender);
+  if (!owner || owner.isDestroyed()) {
+    throw new Error('Untrusted IPC sender');
+  }
+  return event.sender;
+}
+
+function eventOwner(webContents: WebContents) {
+  return {
+    webContentsId: webContents.id,
+    emit(event: ConversationEvent) {
+      if (!webContents.isDestroyed()) {
+        webContents.send('conversation:event', event);
+      }
+    }
+  };
 }
 
 async function readDocument(requestedPath: string): Promise<OpenedDocument> {
@@ -47,11 +97,10 @@ async function readDocument(requestedPath: string): Promise<OpenedDocument> {
     id: randomUUID(),
     fingerprint,
     name: path.basename(requestedPath),
-    path: path.resolve(requestedPath),
     data: data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)
   };
   upsertRecentDocument({
-    path: document.path,
+    path: path.resolve(requestedPath),
     name: document.name,
     fingerprint: document.fingerprint
   });
@@ -119,6 +168,61 @@ ipcMain.handle('note:save', async (_event, input: SaveNoteInput) => {
 
 ipcMain.handle('note:list-by-anchor-ids', async (_event, anchorIds: string[]) => {
   return getNotesByAnchorIds(anchorIds);
+});
+
+ipcMain.handle('ai:settings-get', async (event) => {
+  assertTrustedSender(event);
+  return getSettings();
+});
+
+ipcMain.handle('ai:settings-save', async (event, input: SaveAiSettingsInput) => {
+  assertTrustedSender(event);
+  return saveSettings(input);
+});
+
+ipcMain.handle('conversation:open', async (event, context: ConversationContext) => {
+  const sender = assertTrustedSender(event);
+  return await openConversation(context, eventOwner(sender));
+});
+
+ipcMain.handle('conversation:list-by-document', async (event, input: ListConversationSessionsInput) => {
+  const sender = assertTrustedSender(event);
+  return listConversationSessions(input.documentFingerprint, sender.id);
+});
+
+ipcMain.handle('conversation:send', async (event, input: SendConversationInput) => {
+  const sender = assertTrustedSender(event);
+  await sendConversationMessage(input.conversationId, input.content, eventOwner(sender));
+});
+
+ipcMain.handle('conversation:abort', async (event, conversationId: string) => {
+  const sender = assertTrustedSender(event);
+  abortConversation(conversationId, sender.id);
+});
+
+ipcMain.handle('conversation:abandon-ephemeral', async (event, conversationId: string) => {
+  const sender = assertTrustedSender(event);
+  await abandonEphemeralConversation(conversationId, sender.id);
+});
+
+ipcMain.handle('conversation:confirm-note', async (event, input: ConfirmNoteProposalInput) => {
+  const sender = assertTrustedSender(event);
+  return confirmNoteProposal(input, sender.id);
+});
+
+ipcMain.handle('conversation:discard-note', async (event, proposalId: string) => {
+  const sender = assertTrustedSender(event);
+  discardNoteProposal(proposalId, sender.id);
+});
+
+ipcMain.handle('conversation:finalize-ephemeral', async (event, input: FinalizeEphemeralInput) => {
+  const sender = assertTrustedSender(event);
+  return await finalizeEphemeral(input, sender.id);
+});
+
+ipcMain.handle('conversation:discard', async (event, conversationId: string) => {
+  const sender = assertTrustedSender(event);
+  await discardConversation(conversationId, sender.id);
 });
 
 app.whenReady().then(() => {
