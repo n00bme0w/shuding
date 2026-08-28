@@ -20,6 +20,7 @@ import {
   createAnchor,
   deleteAnchor,
   deleteConversation,
+  deleteNote,
   getAiSettings,
   getAnchorById,
   getNotesByAnchorIds,
@@ -313,12 +314,14 @@ export async function openConversation(context: ConversationContext, owner: Conv
       const existing = Array.from(sessionsByDocument.get(fingerprint) ?? [], (id) => sessions.get(id)).find((session) => session && !session.removed && session.owner.webContentsId === owner.webContentsId && hasMatchingSource(session, context));
       if (existing) { touch(existing); persistSession(existing); return snapshot(existing); }
     }
-    await makeRoom(fingerprint);
+    if (context.kind === 'saved-anchor') await makeRoom(fingerprint);
     const session: Session = { id: randomUUID(), context, documentFingerprint: fingerprint, source, owner, messages: [], lastUsedAt: Date.now(), status: 'idle', removed: false };
     sessions.set(session.id, session);
-    const documentSessions = sessionsByDocument.get(fingerprint) ?? new Set<string>();
-    documentSessions.add(session.id); sessionsByDocument.set(fingerprint, documentSessions);
-    persistSession(session);
+    if (context.kind === 'saved-anchor') {
+      const documentSessions = sessionsByDocument.get(fingerprint) ?? new Set<string>();
+      documentSessions.add(session.id); sessionsByDocument.set(fingerprint, documentSessions);
+      persistSession(session);
+    }
     return snapshot(session);
   });
 }
@@ -377,6 +380,10 @@ export async function finalizeEphemeral(input: FinalizeEphemeralInput, webConten
   if (input.proposalId && (!proposal || proposal.id !== input.proposalId || new Date(proposal.expiresAt).getTime() <= Date.now())) throw new Error('Note proposal expired or unauthorized');
   const body = input.body?.trim(); if (body !== undefined && !body) throw new Error('Note body is required');
   const selection = session.context.selection;
+  // Plan-A: turning a temporary selection into a saved anchor promotes the session's
+  // context to 'saved-anchor' (keeping its transcript) instead of deleting it, so a
+  // quote keeps continuing context when reopened.
+  await makeRoom(session.documentFingerprint);
   const anchor = createAnchor({ documentId: selection.documentFingerprint, pageIndex: selection.pageIndex, kind: 'text', quote: selection.quote, normalizedQuote: selection.normalizedQuote, pageRect: selection.pageRect, normalizedRect: selection.normalizedRect });
   saveAnchor(anchor);
   session.context = { kind: 'saved-anchor', anchorId: anchor.id };
