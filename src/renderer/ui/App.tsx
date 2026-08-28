@@ -435,6 +435,7 @@ function PdfPage({
           <div
             className={`anchor-highlight${anchor.id === activeAnchorId ? ' active' : ''}`}
             key={anchor.id}
+            data-anchor-id={anchor.id}
             style={{
               left: `${anchor.normalizedRect.x * 100}%`,
               top: `${anchor.normalizedRect.y * 100}%`,
@@ -491,6 +492,7 @@ export function App() {
   const [savingProposal, setSavingProposal] = useState(false);
   const [ephemeralSummary, setEphemeralSummary] = useState('');
   const [drawerMode, setDrawerMode] = useState<DrawerMode>(null);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [drawerWidth, setDrawerWidth] = useState(DRAWER_DEFAULT);
   const [isResizingDrawer, setIsResizingDrawer] = useState(false);
   const [aiView, setAiView] = useState<AiView>('chat');
@@ -509,7 +511,12 @@ export function App() {
   const conversationRef = useRef<ConversationSnapshot | null>(null);
   const conversationSnapshotsRef = useRef(new Map<string, ConversationSnapshot>());
   const draftSelectionRef = useRef<DraftSelection | null>(null);
+  const anchorClickDownRef = useRef<{ x: number; y: number } | null>(null);
+  const anchorClickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const anchorHoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const drawerResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
+  const restoredDocumentRef = useRef<string | null>(null);
+  const readingSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     openedDocumentRef.current = openedDocument;
@@ -558,6 +565,7 @@ export function App() {
     setSelectionActionError(null);
     setConversationRunning(false);
     setConversationDraft('');
+    setSavingProposal(false);
   }, []);
 
   const activateConversation = useCallback((snapshot: ConversationSnapshot, status: 'running' | 'idle' = 'idle') => {
@@ -801,6 +809,85 @@ export function App() {
     });
   }, []);
 
+  useEffect(() => {
+    const findAnchorElement = (x: number, y: number): HTMLElement | null => {
+      const candidates = document.elementsFromPoint(x, y);
+      for (const element of candidates) {
+        if (element instanceof HTMLElement && element.matches('.anchor-highlight')) {
+          return element;
+        }
+      }
+      return null;
+    };
+
+    const activateFromClick = (element: HTMLElement) => {
+      const anchorId = element.dataset.anchorId;
+      if (!anchorId) return;
+      const anchor = anchors.find((item) => item.id === anchorId);
+      if (!anchor) return;
+      activateAnchor(anchor);
+    };
+
+    const onMouseDown = (event: MouseEvent) => {
+      if (event.button !== 0) return;
+      const target = event.target;
+      if (target instanceof Element && target.closest('.text-layer, .drawer, .selection-action-bar')) {
+        anchorClickDownRef.current = { x: event.clientX, y: event.clientY };
+      } else {
+        anchorClickDownRef.current = null;
+      }
+    };
+
+    const onMouseUp = (event: MouseEvent) => {
+      const down = anchorClickDownRef.current;
+      anchorClickDownRef.current = null;
+      if (!down) return;
+      const distance = Math.hypot(event.clientX - down.x, event.clientY - down.y);
+      if (distance > 6) return;
+      const element = findAnchorElement(event.clientX, event.clientY);
+      if (!element) return;
+      if (anchorClickTimerRef.current !== null) clearTimeout(anchorClickTimerRef.current);
+      anchorClickTimerRef.current = setTimeout(() => {
+        anchorClickTimerRef.current = null;
+        const fresh = findAnchorElement(event.clientX, event.clientY);
+        if (fresh) activateFromClick(fresh);
+      }, 220);
+    };
+
+    const onDoubleClick = () => {
+      if (anchorClickTimerRef.current !== null) {
+        clearTimeout(anchorClickTimerRef.current);
+        anchorClickTimerRef.current = null;
+      }
+    };
+
+    const onMouseMove = (event: MouseEvent) => {
+      if (anchorHoverTimerRef.current !== null) clearTimeout(anchorHoverTimerRef.current);
+      anchorHoverTimerRef.current = setTimeout(() => {
+        anchorHoverTimerRef.current = null;
+        const element = findAnchorElement(event.clientX, event.clientY);
+        document.querySelectorAll('.page-frame').forEach((frame) => {
+          frame.classList.toggle('has-highlight-hover', false);
+        });
+        const frame = element?.closest('.page-frame');
+        if (frame) frame.classList.add('has-highlight-hover');
+      }, 0);
+    };
+
+    document.addEventListener('mousedown', onMouseDown);
+    document.addEventListener('mouseup', onMouseUp);
+    document.addEventListener('dblclick', onDoubleClick);
+    document.addEventListener('mousemove', onMouseMove);
+    return () => {
+      document.removeEventListener('mousedown', onMouseDown);
+      document.removeEventListener('mouseup', onMouseUp);
+      document.removeEventListener('dblclick', onDoubleClick);
+      document.removeEventListener('mousemove', onMouseMove);
+      if (anchorClickTimerRef.current !== null) clearTimeout(anchorClickTimerRef.current);
+      if (anchorHoverTimerRef.current !== null) clearTimeout(anchorHoverTimerRef.current);
+    };
+  }, [activateAnchor, anchors]);
+
   const summary = useMemo(() => normalizeQuote(selectionText), [selectionText]);
   const conversationQuote = activeConversationContext?.kind === 'ephemeral-selection'
     ? activeConversationContext.selection.quote
@@ -954,6 +1041,7 @@ export function App() {
       setVisiblePageIndices(new Set());
       setCurrentPage(1);
       setScale(DEFAULT_SCALE);
+      restoredDocumentRef.current = null;
        setAnchors([]);
        setNotesByAnchorId({});
         setActiveAnchor(null);
@@ -999,6 +1087,65 @@ export function App() {
     }
     void refreshConversationSessions(openedDocument.fingerprint);
   }, [openedDocument, refreshConversationSessions]);
+
+  useEffect(() => {
+    if (!pdf || !openedDocument) {
+      return;
+    }
+    const fingerprint = openedDocument.fingerprint;
+    if (restoredDocumentRef.current === fingerprint) {
+      return;
+    }
+    let cancelled = false;
+    void window.shuding.getReadingState(fingerprint).then((state) => {
+      if (cancelled || !state || openedDocumentRef.current?.fingerprint !== fingerprint) {
+        return;
+      }
+      restoredDocumentRef.current = fingerprint;
+      if (state.scale >= MIN_SCALE && state.scale <= MAX_SCALE) {
+        setScale(state.scale);
+      }
+      if (state.currentPage >= 1 && state.currentPage <= pageCount) {
+        setCurrentPage(state.currentPage);
+      }
+      const restoreScroll = () => {
+        const pageSurface = pageSurfaceRef.current;
+        if (pageSurface) {
+          pageSurface.scrollTo({ top: Math.max(state.scrollTop ?? 0, 0), behavior: 'auto' });
+        }
+      };
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(restoreScroll);
+      });
+    }).catch((error: unknown) => {
+      console.error('Unable to restore reading state.', error);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [pdf, openedDocument, pageCount]);
+
+  useEffect(() => {
+    if (!openedDocument || !bridgeAvailable) {
+      return;
+    }
+    const fingerprint = openedDocument.fingerprint;
+    if (readingSaveTimerRef.current) {
+      clearTimeout(readingSaveTimerRef.current);
+    }
+    readingSaveTimerRef.current = setTimeout(() => {
+      const pageSurface = pageSurfaceRef.current;
+      const scrollTop = pageSurface?.scrollTop ?? 0;
+      void window.shuding.saveReadingState({ documentFingerprint: fingerprint, scale, currentPage, scrollTop }).catch((error: unknown) => {
+        console.error('Unable to save reading state.', error);
+      });
+    }, 400);
+    return () => {
+      if (readingSaveTimerRef.current) {
+        clearTimeout(readingSaveTimerRef.current);
+      }
+    };
+  }, [openedDocument, scale, currentPage, bridgeAvailable]);
 
   useEffect(() => {
     if (!openedDocument) {
@@ -1316,11 +1463,11 @@ export function App() {
   }
 
   async function deleteCurrentAnchor(anchor: Anchor) {
-    if (!window.confirm('删除这条标注及其笔记？')) {
+    if (!window.confirm('删除这条引用？其笔记和与之关联的 AI 对话也会一并删除。')) {
       return;
     }
 
-    await window.shuding.deleteAnchor({ anchorId: anchor.id });
+    await window.shuding.deleteAnchorCascade({ anchorId: anchor.id });
     if (openedDocumentRef.current?.fingerprint !== anchor.documentId) {
       return;
     }
@@ -1331,11 +1478,15 @@ export function App() {
       delete next[anchor.id];
       return next;
     });
+    if (conversationRef.current?.context.kind === 'saved-anchor' && conversationRef.current.context.anchorId === anchor.id) {
+      clearEphemeralConversationLocal();
+    }
     if (activeAnchor?.id === anchor.id) {
       setActiveAnchor(null);
       setSelectionText('选中一句话后在这里生成锚点');
       setNoteBody('');
     }
+    void refreshConversationSessions();
   }
 
   async function saveAiConfiguration() {
@@ -1448,6 +1599,42 @@ export function App() {
     }
   }
 
+  async function deleteConversationSession(conversationId: string) {
+    if (!bridgeAvailable) {
+      return;
+    }
+    if (!window.confirm('删除这条 AI 对话？其引用与笔记将保留。')) {
+      return;
+    }
+    try {
+      await window.shuding.deleteConversationSession(conversationId);
+      conversationSnapshotsRef.current.delete(conversationId);
+      if (conversationIdRef.current === conversationId) {
+        clearEphemeralConversationLocal();
+      }
+      await refreshConversationSessions();
+    } catch (error: unknown) {
+      const details = error instanceof Error ? error.message : '未知错误';
+      setConversationError(`删除对话失败：${details}`);
+    }
+  }
+
+  async function deleteNoteForAnchor(noteId: string, anchorId: string) {
+    if (!bridgeAvailable) {
+      return;
+    }
+    try {
+      await window.shuding.deleteNote(noteId);
+      setNotesByAnchorId((current) => ({
+        ...current,
+        [anchorId]: (current[anchorId] ?? []).filter((note) => note.id !== noteId)
+      }));
+    } catch (error: unknown) {
+      const details = error instanceof Error ? error.message : '未知错误';
+      setNoteSaveError(`删除笔记失败：${details}`);
+    }
+  }
+
   async function finalizeEphemeral(saveSummary: boolean) {
     if (!conversationId || conversation?.context.kind !== 'ephemeral-selection' || !bridgeAvailable) return;
     const currentConversationId = conversationId;
@@ -1485,7 +1672,7 @@ export function App() {
       const details = error instanceof Error ? error.message : '未知错误';
       if (conversationIdRef.current === currentConversationId) setConversationError(`保存临时对话失败：${details}`);
     } finally {
-      if (conversationIdRef.current === currentConversationId) setSavingProposal(false);
+      setSavingProposal(false);
     }
   }
 
@@ -1509,10 +1696,16 @@ export function App() {
 
   return (
     <div
-      className={`shell${drawerMode ? ' drawer-open' : ''}`}
+      className={`shell${drawerMode ? ' drawer-open' : ''}${sidebarCollapsed ? ' sidebar-collapsed' : ''}`}
       style={drawerMode ? ({ '--drawer-width': `${drawerWidth}px` } as React.CSSProperties) : undefined}
     >
       <aside className="sidebar">
+        {sidebarCollapsed ? (
+          <div className="sidebar-collapsed">
+            <span className="sidebar-collapsed-mark" aria-hidden="true">书</span>
+          </div>
+        ) : (
+        <>
         <div>
           <div className="brand">书钉</div>
           <p className="sidebar-copy">阅读、选句、存档，一次完成。</p>
@@ -1557,13 +1750,26 @@ export function App() {
             </section>
           ) : null}
         </div>
+        </>
+        )}
       </aside>
 
       <main className="reader">
         <header className="topbar">
-          <div>
-            <div className="doc-title">{openedDocument?.name ?? '未打开文档'}</div>
-            <div className="doc-meta">{pageCount > 0 ? `第 ${currentPage} / ${pageCount} 页` : '等待导入 PDF'}</div>
+          <div className="topbar-left">
+            <button
+              type="button"
+              className="sidebar-toggle"
+              onClick={() => setSidebarCollapsed((collapsed) => !collapsed)}
+              aria-label={sidebarCollapsed ? '展开侧栏' : '收起侧栏'}
+              aria-expanded={!sidebarCollapsed}
+            >
+              {sidebarCollapsed ? '☰' : '☰'}
+            </button>
+            <div>
+              <div className="doc-title">{openedDocument?.name ?? '未打开文档'}</div>
+              <div className="doc-meta">{pageCount > 0 ? `第 ${currentPage} / ${pageCount} 页` : '等待导入 PDF'}</div>
+            </div>
           </div>
           <div className="topbar-actions">
             <div className="drawer-controls" aria-label="阅读工具">
@@ -1680,14 +1886,23 @@ export function App() {
                     </button>
                   </div>
                   {anchorNotes.map((note) => (
-                    <button
-                      className={`annotation-note${anchor.id === activeAnchor?.id && note.body === noteBody ? ' active' : ''}`}
-                      key={note.id}
-                      type="button"
-                      onClick={() => activateAnchor(anchor, true, note)}
-                    >
-                      {note.body}
-                    </button>
+                    <div className="annotation-note-row" key={note.id}>
+                      <button
+                        className={`annotation-note${anchor.id === activeAnchor?.id && note.body === noteBody ? ' active' : ''}`}
+                        type="button"
+                        onClick={() => activateAnchor(anchor, true, note)}
+                      >
+                        {note.body}
+                      </button>
+                      <button
+                        className="note-delete"
+                        type="button"
+                        aria-label="删除这条笔记"
+                        onClick={() => void deleteNoteForAnchor(note.id, anchor.id)}
+                      >
+                        ✕
+                      </button>
+                    </div>
                   ))}
                 </div>
               );
@@ -1718,9 +1933,19 @@ export function App() {
             <div className="saved-notes">
               <h3>已保存笔记</h3>
               {notesForAnchor(activeAnchor.id).map((note) => (
-                <button className="annotation-note" key={note.id} type="button" onClick={() => activateAnchor(activeAnchor, false, note)}>
-                  {note.body}
-                </button>
+                <div className="annotation-note-row" key={note.id}>
+                  <button className="annotation-note" type="button" onClick={() => activateAnchor(activeAnchor, false, note)}>
+                    {note.body}
+                  </button>
+                  <button
+                    className="note-delete"
+                    type="button"
+                    aria-label="删除这条笔记"
+                    onClick={() => void deleteNoteForAnchor(note.id, activeAnchor.id)}
+                  >
+                    ✕
+                  </button>
+                </div>
               ))}
               {notesForAnchor(activeAnchor.id).length === 0 ? <p className="annotation-empty">当前引用还没有手动笔记。</p> : null}
             </div>
@@ -1762,16 +1987,28 @@ export function App() {
               {conversationSessions.length > 0 ? (
                 <div className="session-list">
                   {conversationSessions.map((session) => (
-                    <button
+                    <div
                       className={`session-item${session.conversationId === conversationId ? ' active' : ''}`}
                       key={session.conversationId}
-                      type="button"
-                      onClick={() => void openConversationSession(session)}
-                      aria-current={session.conversationId === conversationId ? 'true' : undefined}
                     >
-                      <span className="session-quote">{normalizeQuote(session.quote)}</span>
-                      <small>页 {session.pageIndex + 1} · {formatSessionTime(session.lastUsedAt)} · {session.status === 'running' ? '运行中' : '已暂停'}</small>
-                    </button>
+                      <button
+                        className="session-main"
+                        type="button"
+                        onClick={() => void openConversationSession(session)}
+                        aria-current={session.conversationId === conversationId ? 'true' : undefined}
+                      >
+                        <span className="session-quote">{normalizeQuote(session.quote)}</span>
+                        <small>页 {session.pageIndex + 1} · {formatSessionTime(session.lastUsedAt)} · {session.status === 'running' ? '运行中' : '已暂停'}</small>
+                      </button>
+                      <button
+                        className="session-delete"
+                        type="button"
+                        aria-label="删除该对话"
+                        onClick={() => void deleteConversationSession(session.conversationId)}
+                      >
+                        ✕
+                      </button>
+                    </div>
                   ))}
                 </div>
               ) : (

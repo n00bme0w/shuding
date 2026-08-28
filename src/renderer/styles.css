@@ -41,14 +41,19 @@ input:focus-visible {
 
 .shell {
   display: grid;
-  grid-template-columns: 220px minmax(0, 1fr);
+  grid-template-columns: var(--sidebar-width, 220px) minmax(0, 1fr);
   height: 100dvh;
   min-height: 0;
   overflow: hidden;
 }
 
 .shell.drawer-open {
-  grid-template-columns: 220px minmax(0, 1fr) minmax(0, var(--drawer-width, 380px));
+  grid-template-columns: var(--sidebar-width, 220px) minmax(0, 1fr) minmax(0, var(--drawer-width, 380px));
+}
+
+.shell.sidebar-collapsed,
+.shell.sidebar-collapsed.drawer-open {
+  --sidebar-width: 48px;
 }
 
 .sidebar,
@@ -58,6 +63,55 @@ input:focus-visible {
   padding: 20px;
   background: rgba(255, 255, 255, 0.74);
   border-right: 1px solid rgba(31, 26, 23, 0.09);
+}
+
+.sidebar-collapsed {
+  display: grid;
+  align-content: start;
+  justify-items: center;
+  gap: 12px;
+}
+
+.shell.sidebar-collapsed .sidebar {
+  padding: 16px 8px;
+}
+
+.sidebar-collapsed-mark {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  background: #1f1a17;
+  color: #f7f3ec;
+  font-size: 15px;
+  font-weight: 700;
+  user-select: none;
+}
+
+.topbar-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.sidebar-toggle {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  border: 1px solid rgba(31, 26, 23, 0.12);
+  border-radius: 8px;
+  background: #fff;
+  color: rgba(29, 23, 19, 0.7);
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.sidebar-toggle:hover {
+  background: rgba(31, 26, 23, 0.06);
 }
 
 .drawer {
@@ -373,6 +427,10 @@ button:disabled {
   background: rgba(239, 150, 35, 0.56);
 }
 
+.page-frame.has-highlight-hover .text-layer span {
+  cursor: pointer;
+}
+
 .zoom-controls {
   display: inline-flex;
   align-items: center;
@@ -578,6 +636,37 @@ button:disabled {
   background: rgba(137, 52, 31, 0.08);
 }
 
+.annotation-note-row {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+  min-width: 0;
+}
+
+.annotation-note-row .annotation-note {
+  flex: 1;
+  min-width: 0;
+}
+
+.note-delete {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  align-self: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: rgba(137, 52, 31, 0.72);
+  font-size: 12px;
+  line-height: 1;
+}
+
+.note-delete:hover {
+  background: rgba(137, 52, 31, 0.1);
+  color: rgba(137, 52, 31, 0.95);
+}
+
 .annotation-note {
   width: 100%;
   overflow: hidden;
@@ -672,15 +761,13 @@ button:disabled {
 }
 
 .session-item {
-  display: grid;
-  gap: 3px;
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
   min-width: 0;
-  padding: 8px 9px;
   border: 1px solid rgba(31, 26, 23, 0.12);
   border-radius: 7px;
   background: rgba(255, 255, 255, 0.62);
-  color: inherit;
-  text-align: left;
 }
 
 .session-item:hover {
@@ -691,6 +778,37 @@ button:disabled {
 .session-item.active {
   border-color: rgba(164, 88, 11, 0.64);
   background: rgba(244, 204, 78, 0.16);
+}
+
+.session-main {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+  padding: 8px 9px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+
+.session-delete {
+  flex: 0 0 auto;
+  align-self: center;
+  margin-inline-end: 6px;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: rgba(137, 52, 31, 0.72);
+  font-size: 12px;
+  line-height: 1;
+}
+
+.session-delete:hover {
+  background: rgba(137, 52, 31, 0.1);
+  color: rgba(137, 52, 31, 0.95);
 }
 
 .session-quote {
@@ -1008,7 +1126,7 @@ button:disabled {
 
 @media (max-width: 1120px) {
   .shell.drawer-open {
-    grid-template-columns: 190px minmax(0, 1fr) minmax(0, var(--drawer-width, 340px));
+    grid-template-columns: var(--sidebar-width, 190px) minmax(0, 1fr) minmax(0, var(--drawer-width, 340px));
   }
 
   .sidebar {
@@ -1035,9 +1153,12 @@ button:disabled {
 
 @media (max-width: 880px) {
 
-  .shell,
+  .shell {
+    grid-template-columns: var(--sidebar-width, 176px) minmax(0, 1fr);
+  }
+
   .shell.drawer-open {
-    grid-template-columns: 176px minmax(0, 1fr) minmax(0, var(--drawer-width, 360px));
+    grid-template-columns: var(--sidebar-width, 176px) minmax(0, 1fr) minmax(0, var(--drawer-width, 360px));
   }
 
   .drawer {
