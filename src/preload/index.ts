@@ -15,8 +15,10 @@ import type {
   Note,
   OpenedDocument,
   RecentDocument,
+  ReadingState,
   SaveAiSettingsInput,
   SaveNoteInput,
+  SaveReadingStateInput,
   SendConversationInput
 } from '../shared';
 
@@ -37,9 +39,15 @@ contextBridge.exposeInMainWorld('shuding', {
   listRecentDocuments: () => ipcRenderer.invoke('document:recent-list') as Promise<RecentDocument[]>,
   openRecentDocument: (id: string) =>
     ipcRenderer.invoke('document:recent-open', id) as Promise<OpenedDocument | null>,
+  getReadingState: (documentFingerprint: string) =>
+    ipcRenderer.invoke('reader:state-get', documentFingerprint) as Promise<ReadingState | null>,
+  saveReadingState: (input: SaveReadingStateInput) =>
+    ipcRenderer.invoke('reader:state-save', input) as Promise<ReadingState>,
   saveAnchor: (anchor: AnchorDraft) => ipcRenderer.invoke('anchor:save', anchor) as Promise<Anchor>,
   saveNote: (input: SaveNoteInput) => ipcRenderer.invoke('note:save', input) as Promise<Note>,
   deleteAnchor: (input: DeleteAnchorInput) => ipcRenderer.invoke('anchor:delete', input) as Promise<void>,
+  deleteAnchorCascade: (input: DeleteAnchorInput) => ipcRenderer.invoke('anchor:delete-cascade', input) as Promise<void>,
+  deleteNote: (noteId: string) => ipcRenderer.invoke('note:delete', noteId) as Promise<void>,
   loadAnchors: (documentId: string) =>
     ipcRenderer.invoke('anchor:list-by-document', documentId) as Promise<Anchor[]>,
   loadNotes: (anchorIds: string[]) =>
@@ -65,6 +73,8 @@ contextBridge.exposeInMainWorld('shuding', {
     ipcRenderer.invoke('conversation:finalize-ephemeral', input) as Promise<FinalizeEphemeralResult>,
   discardConversation: (conversationId: string) =>
     ipcRenderer.invoke('conversation:discard', conversationId) as Promise<void>,
+  deleteConversationSession: (conversationId: string) =>
+    ipcRenderer.invoke('conversation:delete-session', conversationId) as Promise<void>,
   subscribeConversationEvents: (listener: (event: ConversationEvent) => void) => {
     conversationListeners.add(listener);
     return () => conversationListeners.delete(listener);
@@ -76,9 +86,13 @@ export type ShudingApi = {
   openDocument(path?: string): Promise<OpenedDocument | null>;
   listRecentDocuments(): Promise<RecentDocument[]>;
   openRecentDocument(id: string): Promise<OpenedDocument | null>;
+  getReadingState(documentFingerprint: string): Promise<ReadingState | null>;
+  saveReadingState(input: SaveReadingStateInput): Promise<ReadingState>;
   saveAnchor(anchor: AnchorDraft): Promise<Anchor>;
   saveNote(input: SaveNoteInput): Promise<Note>;
   deleteAnchor(input: DeleteAnchorInput): Promise<void>;
+  deleteAnchorCascade(input: DeleteAnchorInput): Promise<void>;
+  deleteNote(noteId: string): Promise<void>;
   loadAnchors(documentId: string): Promise<Anchor[]>;
   loadNotes(anchorIds: string[]): Promise<Note[]>;
   getAiSettings(): Promise<AiSettings>;
@@ -92,6 +106,7 @@ export type ShudingApi = {
   discardNoteProposal(proposalId: string): Promise<void>;
   finalizeEphemeral(input: FinalizeEphemeralInput): Promise<FinalizeEphemeralResult>;
   discardConversation(conversationId: string): Promise<void>;
+  deleteConversationSession(conversationId: string): Promise<void>;
   subscribeConversationEvents(listener: (event: ConversationEvent) => void): () => void;
 };
 

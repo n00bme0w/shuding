@@ -379,9 +379,33 @@ export async function finalizeEphemeral(input: FinalizeEphemeralInput, webConten
   const selection = session.context.selection;
   const anchor = createAnchor({ documentId: selection.documentFingerprint, pageIndex: selection.pageIndex, kind: 'text', quote: selection.quote, normalizedQuote: selection.normalizedQuote, pageRect: selection.pageRect, normalizedRect: selection.normalizedRect });
   saveAnchor(anchor);
-  try { const note = body || proposal ? saveNote(anchor.id, body ?? proposal!.body) : null; removeSession(session); deleteConversation(session.id); return { anchor, note }; } catch (error: unknown) { deleteAnchor(anchor.id); throw error; }
+  session.context = { kind: 'saved-anchor', anchorId: anchor.id };
+  session.source = { quote: anchor.quote, pageIndex: anchor.pageIndex, kind: anchor.kind, documentFingerprint: anchor.documentId };
+  const documentSessions = sessionsByDocument.get(session.documentFingerprint) ?? new Set<string>();
+  documentSessions.add(session.id); sessionsByDocument.set(session.documentFingerprint, documentSessions);
+  const note = body || proposal ? saveNote(anchor.id, body ?? proposal!.body) : null;
+  touch(session);
+  try { persistSession(session); } catch (error: unknown) { deleteAnchor(anchor.id); throw error; }
+  return { anchor, note };
 }
 
 export async function discardConversation(conversationId: string, webContentsId: number) { const session = getLiveSession(conversationId, webContentsId); if (session) await discardSession(session, true); }
 export function abandonEphemeralConversation(conversationId: string, webContentsId: number) { return discardConversation(conversationId, webContentsId); }
+
+export async function deleteNoteEntry(noteId: string) {
+  deleteNote(noteId);
+}
+
+export async function deleteConversationSession(conversationId: string, webContentsId: number) {
+  const session = getLiveSession(conversationId, webContentsId);
+  if (session) await discardSession(session, true);
+}
+
+export async function deleteAnchorCascade(anchorId: string, webContentsId: number) {
+  const anchor = getAnchorById(anchorId);
+  if (!anchor) return;
+  const bound = Array.from(sessions.values()).find((session) => session.context.kind === 'saved-anchor' && session.context.anchorId === anchorId && !session.removed);
+  if (bound) await discardSession(bound, true);
+  deleteAnchor(anchorId);
+}
 export function removeConversationOwner(webContentsId: number) { for (const session of Array.from(sessions.values())) if (session.owner.webContentsId === webContentsId) void discardSession(session); }

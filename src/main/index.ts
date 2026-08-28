@@ -6,18 +6,24 @@ import { createHash, randomUUID } from 'node:crypto';
 import {
   createAnchor,
   deleteAnchor,
+  deleteNote,
   getAnchorsByDocumentId,
   getNotesByAnchorIds,
+  getReadingState,
   getRecentDocumentById,
   listRecentDocuments,
   saveAnchor,
   saveNote,
+  saveReadingState,
   upsertRecentDocument
 } from '../db/store';
 import {
   abandonEphemeralConversation,
   abortConversation,
   confirmNoteProposal,
+  deleteAnchorCascade,
+  deleteConversationSession,
+  deleteNoteEntry,
   discardConversation,
   discardNoteProposal,
   finalizeEphemeral,
@@ -39,6 +45,7 @@ import type {
   OpenedDocument,
   SaveAiSettingsInput,
   SaveNoteInput,
+  SaveReadingStateInput,
   SendConversationInput
 } from '../shared';
 
@@ -148,6 +155,14 @@ ipcMain.handle('document:recent-open', async (_event, id: string) => {
   }
 });
 
+ipcMain.handle('reader:state-get', async (_event, documentFingerprint: string) => {
+  return getReadingState(documentFingerprint);
+});
+
+ipcMain.handle('reader:state-save', async (_event, input: SaveReadingStateInput) => {
+  return saveReadingState(input);
+});
+
 ipcMain.handle('anchor:save', async (_event, draft: AnchorDraft) => {
   const anchor = createAnchor(draft);
   saveAnchor(anchor);
@@ -223,6 +238,20 @@ ipcMain.handle('conversation:finalize-ephemeral', async (event, input: FinalizeE
 ipcMain.handle('conversation:discard', async (event, conversationId: string) => {
   const sender = assertTrustedSender(event);
   await discardConversation(conversationId, sender.id);
+});
+
+ipcMain.handle('note:delete', async (_event, noteId: string) => {
+  await deleteNoteEntry(noteId);
+});
+
+ipcMain.handle('conversation:delete-session', async (event, conversationId: string) => {
+  const sender = assertTrustedSender(event);
+  await deleteConversationSession(conversationId, sender.id);
+});
+
+ipcMain.handle('anchor:delete-cascade', async (event, input: DeleteAnchorInput) => {
+  const sender = assertTrustedSender(event);
+  await deleteAnchorCascade(input.anchorId, sender.id);
 });
 
 app.whenReady().then(() => {

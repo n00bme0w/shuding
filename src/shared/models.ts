@@ -172,3 +172,17 @@ export type FinalizeEphemeralResult = {
   anchor: Anchor;
   note: Note | null;
 };
+
+export type ReadingState = {
+  documentFingerprint: string;
+  scale: number;
+  currentPage: number;
+  scrollTop: number;
+};
+
+export type SaveReadingStateInput = {
+  documentFingerprint: string;
+  scale: number;
+  currentPage: number;
+  scrollTop: number;
+};

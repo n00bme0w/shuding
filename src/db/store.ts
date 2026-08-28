@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import path from 'node:path';
 import { app } from 'electron';
 import { randomUUID } from 'node:crypto';
-import type { Anchor, AnchorDraft, ConversationContext, Note, RecentDocument, Rect } from '../shared';
+import type { Anchor, AnchorDraft, ConversationContext, Note, ReadingState, RecentDocument, Rect, SaveReadingStateInput } from '../shared';
 
 let db: Database.Database | null = null;
 
@@ -112,6 +112,78 @@ const MIGRATIONS: ReadonlyArray<{ version: number; up: (database: Database.Datab
         create index if not exists conversations_document_lastused_idx
           on conversations (documentFingerprint, lastUsedAt desc);
       `);
+    }
+  },
+  {
+    version: 3,
+    up(database) {
+      database.exec(`
+        create table if not exists readingStates (
+          documentFingerprint text primary key,
+          scale real not null,
+          currentPage integer not null,
+          scrollTop real not null default 0,
+          updatedAt text not null
+        );
+        create index if not exists readingStates_updatedAt_idx
+          on readingStates (updatedAt desc);
+      `);
+    }
+  },
+  {
+    version: 4,
+    up(database) {
+      const columns = database.prepare('pragma table_info(readingStates)').all() as Array<{ name: string }>;
+      const hasScrollTop = columns.some((column) => column.name === 'scrollTop');
+      if (!hasScrollTop) {
+        database.exec('alter table readingStates add column scrollTop real not null default 0;');
+      }
+    }
+  },
+  {
+    version: 5,
+    up(database) {
+      // Enforce one conversation per saved anchor for the Plan-A (quote as axis)
+      // invariant. Partial unique index so ephemeral-selection rows (anchorId NULL)
+      // coexist freely.
+      database.transaction(() => {
+        // Drop orphaned saved-anchor rows with no bound anchor.
+        database.exec(`
+          delete from conversations
+          where contextKind = 'saved-anchor'
+            and (anchorId is null or anchorId = '');
+        `);
+
+        // Keep only the most recently used row per anchorId so the 1:1 index holds.
+        const duplicates = database.prepare(`
+          select anchorId
+          from conversations
+          where anchorId is not null and anchorId != ''
+          group by anchorId
+          having count(*) > 1
+        `).all() as Array<{ anchorId: string }>;
+        if (duplicates.length > 0) {
+          const listConversations = database.prepare(`
+            select id, lastUsedAt
+            from conversations
+            where anchorId = @anchorId
+            order by lastUsedAt desc, id desc
+          `);
+          const deleteRow = database.prepare('delete from conversations where id = @id');
+          for (const row of duplicates) {
+            const candidates = listConversations.all({ anchorId: row.anchorId }) as Array<{ id: string }>;
+            for (const candidate of candidates.slice(1)) {
+              deleteRow.run({ id: candidate.id });
+            }
+          }
+        }
+
+        database.exec(`
+          create unique index if not exists conversations_anchor_unique
+            on conversations (anchorId)
+            where anchorId is not null and anchorId != '';
+        `);
+      })();
     }
   }
 ];
@@ -277,6 +349,11 @@ export function saveAnchor(anchor: Anchor) {
 export function deleteAnchor(anchorId: string) {
   const database = getDb();
   database.prepare('delete from anchors where id = @anchorId').run({ anchorId });
+}
+
+export function deleteNote(noteId: string) {
+  const database = getDb();
+  database.prepare('delete from notes where id = @noteId').run({ noteId });
 }
 
 export function getAnchorsByDocumentId(documentId: string): Anchor[] {
@@ -468,4 +545,35 @@ export function listConversationsByDocument(documentFingerprint: string, limit: 
 export function deleteConversation(id: string) {
   const database = getDb();
   database.prepare('delete from conversations where id = @id').run({ id });
+}
+
+export type StoredReadingState = {
+  documentFingerprint: string;
+  scale: number;
+  currentPage: number;
+  scrollTop: number;
+  updatedAt: string;
+};
+
+export function saveReadingState(state: SaveReadingStateInput): ReadingState {
+  const database = getDb();
+  const updatedAt = new Date().toISOString();
+  database.prepare(
+    `insert into readingStates (documentFingerprint, scale, currentPage, scrollTop, updatedAt)
+     values (@documentFingerprint, @scale, @currentPage, @scrollTop, @updatedAt)
+     on conflict(documentFingerprint) do update set
+       scale = excluded.scale,
+       currentPage = excluded.currentPage,
+       scrollTop = excluded.scrollTop,
+       updatedAt = excluded.updatedAt`
+  ).run({ ...state, updatedAt });
+  return state;
+}
+
+export function getReadingState(documentFingerprint: string): ReadingState | null {
+  const database = getDb();
+  const row = database.prepare(
+    'select documentFingerprint, scale, currentPage, scrollTop from readingStates where documentFingerprint = @documentFingerprint'
+  ).get({ documentFingerprint }) as Pick<StoredReadingState, 'documentFingerprint' | 'scale' | 'currentPage' | 'scrollTop'> | undefined;
+  return row ?? null;
 }
