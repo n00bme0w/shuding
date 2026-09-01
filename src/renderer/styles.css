@@ -42,13 +42,15 @@ input:focus-visible {
 .shell {
   display: grid;
   grid-template-columns: var(--sidebar-width, 220px) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  align-items: stretch;
   height: 100dvh;
   min-height: 0;
   overflow: hidden;
 }
 
 .shell.drawer-open {
-  grid-template-columns: var(--sidebar-width, 220px) minmax(0, 1fr) minmax(0, var(--drawer-width, 380px));
+  grid-template-columns: var(--sidebar-width, 220px) minmax(0, 1fr) clamp(300px, var(--drawer-width, 380px), 560px);
 }
 
 .shell.sidebar-collapsed,
@@ -59,10 +61,13 @@ input:focus-visible {
 .sidebar,
 .drawer {
   min-height: 0;
-  overflow: auto;
   padding: 20px;
   background: rgba(255, 255, 255, 0.74);
   border-right: 1px solid rgba(31, 26, 23, 0.09);
+}
+
+.sidebar {
+  overflow: auto;
 }
 
 .sidebar-collapsed {
@@ -115,10 +120,14 @@ input:focus-visible {
 }
 
 .drawer {
+  align-self: stretch;
+  height: 100%;
   position: relative;
   display: flex;
   flex-direction: column;
-  padding-left: 4px;
+  overflow: hidden;
+  padding: 0;
+  background: #f8f7f4;
   border-right: 0;
   border-left: 1px solid rgba(31, 26, 23, 0.09);
 }
@@ -279,7 +288,7 @@ button:disabled {
   grid-template-rows: 64px minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
-  overflow: scroll;
+  overflow: hidden;
 }
 
 .topbar {
@@ -287,6 +296,8 @@ button:disabled {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
+  min-width: 0;
+  overflow: hidden;
   padding: 0 20px;
   border-bottom: 1px solid rgba(31, 26, 23, 0.08);
   background: rgba(255, 255, 255, 0.36);
@@ -307,7 +318,10 @@ button:disabled {
 }
 
 .topbar-actions {
+  min-width: 0;
   flex-shrink: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
 }
 
 .drawer-controls button[aria-expanded="true"] {
@@ -465,38 +479,55 @@ button:disabled {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding-bottom: 14px;
+  gap: 10px;
   border-bottom: 1px solid rgba(31, 26, 23, 0.1);
 }
 
 .drawer-header {
   flex-shrink: 0;
-  margin-bottom: 16px;
+  min-height: 54px;
+  padding: 0 16px 0 18px;
+  background: rgba(255, 255, 255, 0.66);
 }
 
 .drawer-header h2,
 .modal-header h2 {
   margin: 0;
-  font-size: 16px;
+  font-size: 14px;
+  font-weight: 650;
 }
 
 .drawer-close {
-  border: 0;
+  min-width: 48px;
+  border: 1px solid transparent;
   border-radius: 6px;
-  padding: 6px 8px;
+  padding: 5px 7px;
   background: transparent;
   color: rgba(29, 23, 19, 0.68);
   font-size: 12px;
 }
 
 .drawer-close:hover {
-  background: rgba(31, 26, 23, 0.06);
+  border-color: rgba(31, 26, 23, 0.1);
+  background: #fff;
 }
 
 .drawer-section {
   display: grid;
   gap: 12px;
+  min-height: 0;
+}
+
+.drawer > .drawer-section:not(.conversation-panel),
+.drawer > .session-queue {
+  flex: 1;
+  overflow: auto;
+  margin: 14px;
+  padding: 0 2px 2px;
+}
+
+.drawer > .bridge-error {
+  margin: 12px 14px 0;
 }
 
 .conversation-messages {
@@ -510,10 +541,12 @@ button:disabled {
 }
 
 .quote-context {
-  margin: 0 0 16px;
-  padding: 12px;
-  border-left: 3px solid rgba(164, 88, 11, 0.62);
-  background: rgba(244, 204, 78, 0.12);
+  margin: 12px 14px 10px;
+  padding: 10px 11px;
+  border: 1px solid rgba(164, 88, 11, 0.2);
+  border-left: 3px solid rgba(164, 88, 11, 0.72);
+  border-radius: 6px;
+  background: rgba(244, 204, 78, 0.1);
 }
 
 .quote-context p {
@@ -576,12 +609,12 @@ button:disabled {
 
 .drawer textarea {
   width: 100%;
-  min-height: 180px;
-  padding: 10px;
+  min-height: 150px;
+  padding: 10px 11px;
   border: 1px solid rgba(31, 26, 23, 0.16);
-  border-radius: 8px;
+  border-radius: 6px;
   resize: vertical;
-  background: #fff;
+  background: rgba(255, 255, 255, 0.82);
 }
 
 .primary.full {
@@ -589,10 +622,15 @@ button:disabled {
   min-height: 36px;
 }
 
+.note-save {
+  min-height: 32px;
+  padding-block: 6px;
+}
+
 .saved-notes {
   display: grid;
-  gap: 7px;
-  padding-top: 14px;
+  gap: 5px;
+  padding-top: 12px;
   border-top: 1px solid rgba(31, 26, 23, 0.1);
 }
 
@@ -606,13 +644,19 @@ button:disabled {
 .annotation-item {
   display: grid;
   width: 100%;
-  gap: 4px;
-  padding: 10px;
+  gap: 5px;
+  padding: 10px 11px;
   border: 1px solid rgba(31, 26, 23, 0.12);
-  border-radius: 8px;
-  background: #fff;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.76);
   color: inherit;
   text-align: left;
+}
+
+.annotation-item:hover,
+.annotation-item.active {
+  border-color: rgba(164, 88, 11, 0.48);
+  background: #fffdf8;
 }
 
 .annotation-item small,
@@ -625,7 +669,7 @@ button:disabled {
 .delete-anchor {
   align-self: stretch;
   border: 1px solid rgba(137, 52, 31, 0.22);
-  border-radius: 8px;
+  border-radius: 6px;
   padding: 0 8px;
   background: transparent;
   color: rgba(137, 52, 31, 0.82);
@@ -670,7 +714,7 @@ button:disabled {
 .annotation-note {
   width: 100%;
   overflow: hidden;
-  padding: 8px 10px;
+  padding: 7px 9px;
   border: 0;
   border-left: 2px solid rgba(31, 26, 23, 0.16);
   background: transparent;
@@ -695,23 +739,29 @@ button:disabled {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  margin: 0 14px 14px;
+  padding: 12px;
+  border: 1px solid rgba(31, 26, 23, 0.1);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.56);
 }
 
 .ai-view-tabs {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 4px;
-  margin-bottom: 14px;
-  padding: 3px;
+  flex-shrink: 0;
+  margin: 12px 14px;
+  padding: 2px;
   border: 1px solid rgba(31, 26, 23, 0.12);
-  border-radius: 9px;
-  background: rgba(255, 255, 255, 0.5);
+  border-radius: 6px;
+  background: rgba(31, 26, 23, 0.04);
 }
 
 .ai-view-tab {
   padding: 7px 0;
   border: 0;
-  border-radius: 6px;
+  border-radius: 4px;
   background: transparent;
   color: rgba(29, 23, 19, 0.6);
   font-size: 13px;
@@ -730,9 +780,14 @@ button:disabled {
 }
 
 .session-queue {
-  display: grid;
-  gap: 8px;
-  margin-bottom: 14px;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  gap: 10px;
+  margin-bottom: 0;
 }
 
 .session-queue-header {
@@ -744,7 +799,8 @@ button:disabled {
 
 .session-queue-header h3 {
   margin: 0;
-  font-size: 13px;
+  font-size: 12px;
+  font-weight: 650;
 }
 
 .session-queue-header span {
@@ -754,8 +810,12 @@ button:disabled {
 
 .session-list {
   display: grid;
-  gap: 5px;
-  max-height: 198px;
+  flex: 1;
+  grid-template-columns: minmax(0, 1fr);
+  width: 100%;
+  min-width: 0;
+  gap: 6px;
+  min-height: 0;
   overflow: auto;
   padding-right: 2px;
 }
@@ -763,11 +823,12 @@ button:disabled {
 .session-item {
   display: flex;
   align-items: stretch;
-  gap: 4px;
+  gap: 2px;
+  width: 100%;
   min-width: 0;
   border: 1px solid rgba(31, 26, 23, 0.12);
-  border-radius: 7px;
-  background: rgba(255, 255, 255, 0.62);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.72);
 }
 
 .session-item:hover {
@@ -782,10 +843,10 @@ button:disabled {
 
 .session-main {
   display: grid;
-  gap: 3px;
+  gap: 4px;
   min-width: 0;
   flex: 1;
-  padding: 8px 9px;
+  padding: 10px 10px 9px;
   background: transparent;
   color: inherit;
   text-align: left;
@@ -794,7 +855,7 @@ button:disabled {
 .session-delete {
   flex: 0 0 auto;
   align-self: center;
-  margin-inline-end: 6px;
+  margin-inline-end: 5px;
   width: 22px;
   height: 22px;
   padding: 0;
@@ -832,10 +893,10 @@ button:disabled {
 }
 
 .conversation-message {
-  padding: 8px 10px;
+  padding: 9px 10px;
   border: 1px solid rgba(31, 26, 23, 0.08);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.5);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.76);
 }
 
 .conversation-message.user {
@@ -968,7 +1029,7 @@ button:disabled {
   max-height: 160px;
   resize: vertical;
   border: 1px solid rgba(31, 26, 23, 0.14);
-  border-radius: 10px;
+  border-radius: 6px;
   padding: 10px 12px;
   background: #fff;
   line-height: 1.5;
@@ -991,7 +1052,7 @@ button:disabled {
   flex: 1;
   min-height: 34px;
   border: 1px solid rgba(31, 26, 23, 0.12);
-  border-radius: 10px;
+  border-radius: 6px;
   background: #fff;
   transition: background 0.15s ease, border-color 0.15s ease, transform 0.05s ease;
 }
@@ -1012,8 +1073,10 @@ button:disabled {
 .proposal-preview {
   display: grid;
   gap: 8px;
-  padding-top: 12px;
+  padding: 10px;
   border-top: 1px solid rgba(31, 26, 23, 0.1);
+  border-radius: 6px;
+  background: rgba(244, 204, 78, 0.1);
 }
 
 .ai-empty-state {
@@ -1126,7 +1189,7 @@ button:disabled {
 
 @media (max-width: 1120px) {
   .shell.drawer-open {
-    grid-template-columns: var(--sidebar-width, 190px) minmax(0, 1fr) minmax(0, var(--drawer-width, 340px));
+    grid-template-columns: var(--sidebar-width, 190px) minmax(0, 1fr) clamp(300px, var(--drawer-width, 340px), 500px);
   }
 
   .sidebar {
@@ -1158,7 +1221,7 @@ button:disabled {
   }
 
   .shell.drawer-open {
-    grid-template-columns: var(--sidebar-width, 176px) minmax(0, 1fr) minmax(0, var(--drawer-width, 360px));
+    grid-template-columns: var(--sidebar-width, 176px) minmax(0, 1fr) clamp(300px, var(--drawer-width, 360px), 440px);
   }
 
   .drawer {

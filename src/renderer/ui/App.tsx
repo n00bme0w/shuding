@@ -1766,10 +1766,7 @@ export function App() {
             >
               {sidebarCollapsed ? '☰' : '☰'}
             </button>
-            <div>
-              <div className="doc-title">{openedDocument?.name ?? '未打开文档'}</div>
-              <div className="doc-meta">{pageCount > 0 ? `第 ${currentPage} / ${pageCount} 页` : '等待导入 PDF'}</div>
-            </div>
+            <div className="doc-meta">{pageCount > 0 ? `第 ${currentPage} / ${pageCount} 页` : '等待导入 PDF'}</div>
           </div>
           <div className="topbar-actions">
             <div className="drawer-controls" aria-label="阅读工具">
@@ -1924,7 +1921,7 @@ export function App() {
           <section className="drawer-section note-composer">
           <h3>手动笔记</h3>
           <textarea value={noteBody} onChange={(event) => setNoteBody(event.target.value)} placeholder="在这里记录这一段的想法" />
-          <button className="primary full" onClick={() => void saveCurrentNote()} disabled={(!activeAnchor && !draftSelection) || !noteBody.trim() || saving}>
+          <button className="primary full note-save" type="button" onClick={() => void saveCurrentNote()} disabled={(!activeAnchor && !draftSelection) || !noteBody.trim() || saving}>
             {saving ? '保存中' : '保存笔记'}
           </button>
           {noteSaveError ? <p className="note-status error">{noteSaveError}</p> : null}
