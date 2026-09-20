@@ -78,7 +78,8 @@ input:focus-visible {
 .sidebar {
   display: flex;
   flex-direction: column;
-  overflow: auto;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .sidebar-collapsed {
