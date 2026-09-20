@@ -146,6 +146,15 @@ input:focus-visible {
   box-shadow: -14px 0 34px rgba(27, 34, 42, 0.12);
 }
 
+.drawer-scrim {
+  position: absolute;
+  inset: 0;
+  z-index: 11;
+  border: 0;
+  background: rgba(27, 34, 42, 0.08);
+  cursor: default;
+}
+
 .drawer-resize-handle {
   position: absolute;
   left: 0;

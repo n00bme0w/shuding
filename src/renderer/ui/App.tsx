@@ -621,6 +621,18 @@ export function App() {
   }, [openedDocument]);
 
   useEffect(() => {
+    if (!confirmationRequest) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        resolveConfirmation(false);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [confirmationRequest]);
+
+  useEffect(() => {
     assistantDraftRef.current = assistantDraft;
   }, [assistantDraft]);
 
@@ -2607,6 +2619,7 @@ export function App() {
         </section>
       </main>
 
+      {drawerMode ? <button className="drawer-scrim" type="button" aria-label="关闭工作面板" onClick={() => setDrawerMode(null)} /> : null}
       {drawerMode ? (
       <aside className="drawer" id="contextual-drawer" data-resizing={isResizingDrawer || undefined} aria-label={drawerMode === 'annotations' ? '标注' : drawerMode === 'note' ? '笔记' : 'AI 对话'}>
         <div
