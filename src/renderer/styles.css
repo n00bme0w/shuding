@@ -282,6 +282,8 @@ button:disabled {
   min-height: 0;
   height: 0;
   overflow-y: auto;
+  align-content: start;
+  grid-auto-rows: max-content;
   padding-right: 2px;
 }
 
