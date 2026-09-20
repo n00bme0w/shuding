@@ -112,12 +112,20 @@ export type EphemeralSelectionConversationContext = {
     normalizedQuote: string;
     pageRect: Rect;
     normalizedRect: Rect;
+    mode?: 'voice-page';
   };
+};
+
+export type DocumentConversationContext = {
+  kind: 'document';
+  documentFingerprint: string;
+  fresh?: boolean;
 };
 
 export type ConversationContext =
   | SavedAnchorConversationContext
-  | EphemeralSelectionConversationContext;
+  | EphemeralSelectionConversationContext
+  | DocumentConversationContext;
 
 export type ConversationSnapshot = {
   conversationId: string;
@@ -143,7 +151,10 @@ export type ConversationEvent =
   | { type: 'assistant_delta'; conversationId: string; delta: string }
   | { type: 'tool'; conversationId: string; toolName: string; status: 'running' | 'completed' | 'failed' }
   | { type: 'proposal'; conversationId: string; proposal: PendingNoteProposal }
-  | { type: 'error'; conversationId: string; message: string };
+  | { type: 'error'; conversationId: string; message: string }
+  | { type: 'index_consent'; conversationId: string; documentFingerprint: string; estimatedDiskBytes: number }
+  | { type: 'navigate_to_page'; conversationId: string; documentFingerprint: string; page: number; reason?: string; quote?: string }
+  | { type: 'auto_anchor'; conversationId: string; documentFingerprint: string; page: number; quote: string };
 
 export type ConfirmNoteProposalInput = {
   conversationId: string;
@@ -178,6 +189,7 @@ export type ReadingState = {
   scale: number;
   currentPage: number;
   scrollTop: number;
+  pageOffset?: number;
 };
 
 export type SaveReadingStateInput = {
@@ -185,4 +197,30 @@ export type SaveReadingStateInput = {
   scale: number;
   currentPage: number;
   scrollTop: number;
+  pageOffset?: number;
 };
+
+export type DocumentChunkInput = {
+  documentFingerprint: string;
+  pageIndex: number;
+  chunkIndex: number;
+  text: string;
+};
+
+export type BookSearchInput = {
+  documentFingerprint: string;
+  query: string;
+  limit?: number;
+};
+
+export type BookSearchResult = DocumentChunkInput & {
+  id: string;
+  score: number;
+};
+
+export type BookIndexConsentInput = {
+  documentFingerprint: string;
+  allowed: boolean;
+};
+
+export type BookIndexStatus = 'building' | 'ready' | 'declined' | 'missing';

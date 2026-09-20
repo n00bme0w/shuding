@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { getDocument, GlobalWorkerOptions, TextLayer, type PDFDocumentProxy, type PDFPageProxy } from 'pdfjs-dist';
 import { marked } from 'marked';
+import markedKatex from 'marked-katex-extension';
+import 'katex/dist/katex.min.css';
 import { normalizeQuote } from '../../shared';
 import type {
   AiSettings,
@@ -18,6 +20,7 @@ import type {
 GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.mjs', import.meta.url).toString();
 
 marked.setOptions({ breaks: true, gfm: true });
+marked.use(markedKatex({ throwOnError: false }));
 
 // Lightweight, safe-enough markdown rendering for assistant replies.
 // We disallow raw HTML by escaping it first so model output can't inject scripts.
@@ -61,6 +64,40 @@ type SelectionActionPosition = {
   left: number;
   top: number;
 };
+
+type AnchorContextMenu = SelectionActionPosition & {
+  anchorId: string;
+};
+
+type BookIndexConsent = {
+  conversationId: string;
+  documentFingerprint: string;
+  estimatedDiskBytes: number;
+};
+
+type BookIndexProgress = {
+  current: number;
+  total: number;
+  phase: 'extracting' | 'saving';
+};
+
+type ConfirmationRequest = {
+  title: string;
+  message: string;
+  confirmLabel?: string;
+};
+
+function findTextLayerTarget(pageFrame: HTMLElement, quote: string) {
+  const spans = Array.from(pageFrame.querySelectorAll<HTMLElement>('.text-layer span'));
+  const normalizedQuote = normalizeQuote(quote);
+  if (!normalizedQuote || spans.length === 0) return null;
+  const tokens = normalizedQuote.split(/\s+/).filter((token) => token.length >= 8).sort((a, b) => b.length - a.length);
+  const candidates = tokens.length > 0 ? tokens : [normalizedQuote.slice(0, 24)];
+  return spans.find((span) => {
+    const text = normalizeQuote(span.textContent ?? '');
+    return candidates.some((candidate) => text.includes(candidate));
+  }) ?? null;
+}
 
 type SelectionGeometry = {
   pageIndex: number;
@@ -230,9 +267,10 @@ type PdfPageProps = {
   renderPriority: number | undefined;
   scrollRootRef: RefObject<HTMLElement | null>;
   anchors: Anchor[];
+  notesByAnchorId: Record<string, Note[]>;
   activeAnchorId: string | null;
+  hoveredAnchorId: string | null;
   draftRects: NormalizedRect[];
-  onVisible: (pageNumber: number) => void;
   onViewportChange: (pageIndex: number, isVisible: boolean) => void;
 };
 
@@ -279,9 +317,10 @@ function PdfPage({
   renderPriority,
   scrollRootRef,
   anchors,
+  notesByAnchorId,
   activeAnchorId,
+  hoveredAnchorId,
   draftRects,
-  onVisible,
   onViewportChange
 }: PdfPageProps) {
   const frameRef = useRef<HTMLDivElement>(null);
@@ -299,9 +338,6 @@ function PdfPage({
     const observer = new IntersectionObserver(
       ([entry]) => {
         onViewportChange(pageIndex, entry.isIntersecting);
-        if (entry.isIntersecting && entry.intersectionRatio >= 0.5) {
-          onVisible(pageIndex + 1);
-        }
       },
       { root: scrollRoot, threshold: [0, 0.5] }
     );
@@ -311,7 +347,7 @@ function PdfPage({
       observer.disconnect();
       onViewportChange(pageIndex, false);
     };
-  }, [onViewportChange, onVisible, pageIndex, scrollRootRef]);
+  }, [onViewportChange, pageIndex, scrollRootRef]);
 
   useEffect(() => {
     if (renderPriority === undefined) {
@@ -418,7 +454,7 @@ function PdfPage({
           <div className="text-layer" ref={textLayerRef} />
         </>
       ) : null}
-      <div className="anchor-overlay" aria-hidden="true">
+      <div className="anchor-overlay">
         {draftRects.map((rect, index) => (
           <div
             className="draft-highlight"
@@ -444,6 +480,30 @@ function PdfPage({
             }}
           />
         ))}
+        {anchors.flatMap((anchor) => {
+          const notes = notesByAnchorId[anchor.id] ?? [];
+          if (notes.length === 0 || (anchor.id !== activeAnchorId && anchor.id !== hoveredAnchorId)) {
+            return [];
+          }
+          const latestNote = notes.at(-1);
+          if (!latestNote) return [];
+          return [
+            <div
+              className="reading-note-preview"
+              key={`note-preview-${anchor.id}`}
+              style={{
+                left: `${Math.min(anchor.normalizedRect.x + anchor.normalizedRect.width + 0.015, 0.68) * 100}%`,
+                top: `${Math.min(anchor.normalizedRect.y, 0.82) * 100}%`
+              }}
+            >
+              <div className="reading-note-preview-header">
+                <span>笔记</span>
+                <span>{notes.length} 条</span>
+              </div>
+              <p>{latestNote.body}</p>
+            </div>
+          ];
+        })}
       </div>
     </div>
   );
@@ -462,9 +522,11 @@ export function App() {
   const [anchors, setAnchors] = useState<Anchor[]>([]);
   const [notesByAnchorId, setNotesByAnchorId] = useState<Record<string, Note[]>>({});
   const [activeAnchor, setActiveAnchor] = useState<Anchor | null>(null);
+  const [hoveredAnchorId, setHoveredAnchorId] = useState<string | null>(null);
   const [draftSelection, setDraftSelection] = useState<DraftSelection | null>(null);
   const [selectionPreview, setSelectionPreview] = useState<{ pageIndex: number; rects: NormalizedRect[] } | null>(null);
   const [noteBody, setNoteBody] = useState('');
+  const [noteEditorOpen, setNoteEditorOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [noteSaveError, setNoteSaveError] = useState<string | null>(null);
   const [noteSaved, setNoteSaved] = useState(false);
@@ -484,10 +546,11 @@ export function App() {
   const [conversationSessions, setConversationSessions] = useState<ConversationSessionSummary[]>([]);
   const [conversationDraft, setConversationDraft] = useState('');
   const [conversationRunning, setConversationRunning] = useState(false);
+  const [speechRecognitionState, setSpeechRecognitionState] = useState<'idle' | 'listening' | 'transcribing'>('idle');
+  const [speechRecognitionError, setSpeechRecognitionError] = useState<string | null>(null);
   const [assistantDraft, setAssistantDraft] = useState('');
   const [toolStatus, setToolStatus] = useState<string | null>(null);
   const [conversationError, setConversationError] = useState<string | null>(null);
-  const [conversationNotice, setConversationNotice] = useState<string | null>(null);
   const [pendingProposal, setPendingProposal] = useState<PendingNoteProposal | null>(null);
   const [savingProposal, setSavingProposal] = useState(false);
   const [ephemeralSummary, setEphemeralSummary] = useState('');
@@ -500,6 +563,13 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [selectionActionPosition, setSelectionActionPosition] = useState<SelectionActionPosition | null>(null);
   const [selectionActionError, setSelectionActionError] = useState<string | null>(null);
+  const [anchorContextMenu, setAnchorContextMenu] = useState<AnchorContextMenu | null>(null);
+  const [bookIndexConsent, setBookIndexConsent] = useState<BookIndexConsent | null>(null);
+  const [bookIndexStatus, setBookIndexStatus] = useState<'building' | 'ready' | 'declined' | 'missing'>('missing');
+  const [buildingBookIndex, setBuildingBookIndex] = useState(false);
+  const [bookIndexProgress, setBookIndexProgress] = useState<BookIndexProgress | null>(null);
+  const [navigationNotice, setNavigationNotice] = useState<{ page: number; reason?: string } | null>(null);
+  const [confirmationRequest, setConfirmationRequest] = useState<ConfirmationRequest | null>(null);
   const outputScale = useOutputScale();
   const pageSurfaceRef = useRef<HTMLElement>(null);
   const openedDocumentRef = useRef<OpenedDocument | null>(null);
@@ -514,9 +584,37 @@ export function App() {
   const anchorClickDownRef = useRef<{ x: number; y: number } | null>(null);
   const anchorClickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const anchorHoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hoveredAnchorIdRef = useRef<string | null>(null);
   const drawerResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const restoredDocumentRef = useRef<string | null>(null);
+  const readingStateReadyRef = useRef<string | null>(null);
   const readingSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const navigationHistoryRef = useRef<Array<{ documentFingerprint: string; page: number; scrollTop: number }>>([]);
+  const speechBaseDraftRef = useRef('');
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const audioWorkletRef = useRef<AudioWorkletNode | null>(null);
+  const voiceChunkQueueRef = useRef(Promise.resolve());
+  const speechCommittedRef = useRef('');
+  const speechAutoSendRef = useRef(false);
+  const speechStateRef = useRef<'idle' | 'listening' | 'transcribing'>('idle');
+  const pushToTalkHeldRef = useRef(false);
+  const sendConversationMessageRef = useRef<(content?: string) => Promise<void>>(async () => {});
+  const confirmationResolverRef = useRef<((confirmed: boolean) => void) | null>(null);
+
+  function requestConfirmation(request: ConfirmationRequest) {
+    return new Promise<boolean>((resolve) => {
+      confirmationResolverRef.current = resolve;
+      setConfirmationRequest(request);
+    });
+  }
+
+  function resolveConfirmation(confirmed: boolean) {
+    confirmationResolverRef.current?.(confirmed);
+    confirmationResolverRef.current = null;
+    setConfirmationRequest(null);
+  }
 
   useEffect(() => {
     openedDocumentRef.current = openedDocument;
@@ -525,6 +623,10 @@ export function App() {
   useEffect(() => {
     assistantDraftRef.current = assistantDraft;
   }, [assistantDraft]);
+
+  useEffect(() => {
+    speechStateRef.current = speechRecognitionState;
+  }, [speechRecognitionState]);
 
   useEffect(() => {
     conversationIdRef.current = conversationId;
@@ -545,6 +647,29 @@ export function App() {
     conversationRunningRef.current = conversationRunning;
   }, [conversationRunning]);
 
+  useEffect(() => () => {
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    audioSourceRef.current?.disconnect();
+    audioWorkletRef.current?.disconnect();
+    void audioContextRef.current?.close();
+  }, []);
+
+  useEffect(() => window.shuding.subscribeVoiceEvents((event) => {
+    const join = (left: string, right: string) => `${left}${left && right ? '\n' : ''}${right}`;
+    if (event.type === 'partial') {
+      setConversationDraft(join(speechBaseDraftRef.current, join(speechCommittedRef.current, event.text)));
+      return;
+    }
+    speechCommittedRef.current = join(speechCommittedRef.current, event.text);
+    setConversationDraft(join(speechBaseDraftRef.current, speechCommittedRef.current));
+    if (event.type === 'final') {
+      const sendAfterTranscription = speechAutoSendRef.current;
+      speechAutoSendRef.current = false;
+      setSpeechRecognitionState('idle');
+      if (sendAfterTranscription && event.text.trim()) void sendConversationMessageRef.current(event.text);
+    }
+  }), []);
+
   useEffect(() => {
     draftSelectionRef.current = draftSelection;
   }, [draftSelection]);
@@ -561,7 +686,6 @@ export function App() {
     setEphemeralSummary('');
     setToolStatus(null);
     setConversationError(null);
-    setConversationNotice(null);
     setSelectionActionError(null);
     setConversationRunning(false);
     setConversationDraft('');
@@ -580,7 +704,6 @@ export function App() {
     setAssistantDraft('');
     setToolStatus(null);
     setConversationError(null);
-    setConversationNotice(null);
     setEphemeralSummary('');
   }, []);
 
@@ -669,11 +792,157 @@ export function App() {
         setToolStatus(`${event.toolName}: ${event.status === 'running' ? '运行中' : event.status === 'completed' ? '完成' : '失败'}`);
       } else if (event.type === 'proposal') {
         setPendingProposal(event.proposal);
+      } else if (event.type === 'index_consent') {
+        setBookIndexConsent(event);
+      } else if (event.type === 'navigate_to_page') {
+        if (event.documentFingerprint !== openedDocumentRef.current?.fingerprint) return;
+        const page = Math.max(1, Math.min(pageCount || event.page, event.page));
+        const pageFrame = pageSurfaceRef.current?.querySelector<HTMLElement>(`[data-page-index="${page - 1}"]`);
+        if (pageFrame && pageSurfaceRef.current) {
+          navigationHistoryRef.current = [
+            ...navigationHistoryRef.current,
+            {
+              documentFingerprint: openedDocumentRef.current?.fingerprint ?? event.documentFingerprint,
+              page: currentPage,
+              scrollTop: pageSurfaceRef.current.scrollTop
+            }
+          ].slice(-20);
+          pageSurfaceRef.current.scrollTo({ top: Math.max(pageFrame.offsetTop - 28, 0), behavior: 'smooth' });
+          setCurrentPage(page);
+          setNavigationNotice({ page, reason: event.reason });
+          window.setTimeout(() => setNavigationNotice(null), 5_000);
+          if (event.quote) {
+            const focusTarget = (attempt: number) => {
+              const target = findTextLayerTarget(pageFrame, event.quote ?? '');
+              if (target) {
+                target.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
+                target.classList.add('ai-navigation-target');
+                window.setTimeout(() => target.classList.remove('ai-navigation-target'), 2_500);
+              } else if (attempt < 3) {
+                window.setTimeout(() => focusTarget(attempt + 1), 350);
+              }
+            };
+            window.setTimeout(() => focusTarget(0), 350);
+          }
+        }
+      } else if (event.type === 'auto_anchor') {
+        if (event.documentFingerprint === openedDocumentRef.current?.fingerprint) {
+          void saveAutoAnchor(event.page, event.quote);
+        }
       } else if (event.type === 'error') {
         setConversationError(event.message);
       }
     });
-  }, [bridgeAvailable, refreshConversationSessions]);
+  }, [bridgeAvailable, pageCount, refreshConversationSessions]);
+
+  async function saveAutoAnchor(page: number, quote: string) {
+    const documentId = openedDocumentRef.current?.fingerprint;
+    if (!documentId || !quote.trim()) return;
+    const locate = async (attempt: number): Promise<void> => {
+      const pageFrame = pageSurfaceRef.current?.querySelector<HTMLElement>(`[data-page-index="${page - 1}"]`);
+      const target = pageFrame ? findTextLayerTarget(pageFrame, quote) : null;
+      if (!pageFrame || !target) {
+        if (attempt < 8) window.setTimeout(() => { void locate(attempt + 1); }, 250);
+        return;
+      }
+      const bounds = pageFrame.getBoundingClientRect();
+      const rect = target.getBoundingClientRect();
+      if (bounds.width <= 0 || bounds.height <= 0 || rect.width <= 0 || rect.height <= 0) return;
+      const normalizedRect = {
+        x: clamp((rect.left - bounds.left) / bounds.width, 0, 1),
+        y: clamp((rect.top - bounds.top) / bounds.height, 0, 1),
+        width: clamp(rect.width / bounds.width, 0.002, 1),
+        height: clamp(rect.height / bounds.height, 0.002, 1)
+      };
+      try {
+        const anchor = await window.shuding.saveAnchor({
+          documentId,
+          pageIndex: page - 1,
+          kind: 'text',
+          quote: quote.trim(),
+          normalizedQuote: normalizeQuote(quote),
+          pageRect: { x: rect.left - bounds.left, y: rect.top - bounds.top, width: rect.width, height: rect.height },
+          normalizedRect,
+          confidence: 1
+        });
+        setAnchors((current) => current.some((item) => item.documentId === anchor.documentId && item.pageIndex === anchor.pageIndex && item.normalizedQuote === anchor.normalizedQuote) ? current : [...current, anchor]);
+      } catch (error: unknown) {
+        setConversationError(`自动创建高亮失败：${error instanceof Error ? error.message : '未知错误'}`);
+      }
+    };
+    await locate(0);
+  }
+
+  function restorePreviousReadingPosition() {
+    const currentDocumentFingerprint = openedDocumentRef.current?.fingerprint;
+    const previous = navigationHistoryRef.current.pop();
+    if (!previous || previous.documentFingerprint !== currentDocumentFingerprint) return;
+    const pageSurface = pageSurfaceRef.current;
+    const pageFrame = pageSurface?.querySelector<HTMLElement>(`[data-page-index="${previous.page - 1}"]`);
+    if (!pageSurface || !pageFrame) return;
+    pageSurface.scrollTo({ top: Math.max(previous.scrollTop, 0), behavior: 'smooth' });
+    setCurrentPage(previous.page);
+    setNavigationNotice({ page: previous.page, reason: '已返回上一个阅读位置' });
+    window.setTimeout(() => setNavigationNotice(null), 3_000);
+  }
+
+  useEffect(() => {
+    navigationHistoryRef.current = [];
+  }, [openedDocument?.fingerprint]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'ArrowLeft' || (!event.altKey && !event.ctrlKey && !event.metaKey)) return;
+      if (navigationHistoryRef.current.length === 0) return;
+      event.preventDefault();
+      restorePreviousReadingPosition();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  });
+
+  async function respondToBookIndexConsent(allowed: boolean) {
+    const request = bookIndexConsent;
+    if (!request || !bridgeAvailable) return;
+    setBookIndexConsent(null);
+    if (!allowed) {
+      await window.shuding.setBookIndexConsent({ documentFingerprint: request.documentFingerprint, allowed: false });
+      setBookIndexStatus('declined');
+      return;
+    }
+    if (!pdf || openedDocumentRef.current?.fingerprint !== request.documentFingerprint) {
+      setConversationError('当前书籍已更改，无法建立索引。');
+      return;
+    }
+    setBuildingBookIndex(true);
+    setBookIndexProgress({ current: 0, total: pdf.numPages, phase: 'extracting' });
+    try {
+      await window.shuding.setBookIndexConsent({ documentFingerprint: request.documentFingerprint, allowed: true });
+      const chunks: Array<{ documentFingerprint: string; pageIndex: number; chunkIndex: number; text: string }> = [];
+      for (let pageIndex = 0; pageIndex < pdf.numPages; pageIndex += 1) {
+        const page = await pdf.getPage(pageIndex + 1);
+        const content = await page.getTextContent();
+        const text = content.items.map((item) => 'str' in item ? item.str : '').join(' ').replace(/\s+/g, ' ').trim();
+        page.cleanup();
+        setBookIndexProgress({ current: pageIndex + 1, total: pdf.numPages, phase: 'extracting' });
+        const words = text.split(' ').filter(Boolean);
+        for (let start = 0, chunkIndex = 0; start < words.length; start += 180, chunkIndex += 1) {
+          const chunkText = words.slice(start, start + 180).join(' ');
+          if (chunkText) chunks.push({ documentFingerprint: request.documentFingerprint, pageIndex, chunkIndex, text: chunkText });
+        }
+      }
+      if (openedDocumentRef.current?.fingerprint !== request.documentFingerprint) return;
+      setBookIndexProgress({ current: pdf.numPages, total: pdf.numPages, phase: 'saving' });
+      await window.shuding.indexDocumentChunks(chunks);
+      setBookIndexStatus('ready');
+      setConversationError(null);
+    } catch (error: unknown) {
+      setConversationError(`书籍索引失败：${error instanceof Error ? error.message : '未知错误'}`);
+    } finally {
+      setBuildingBookIndex(false);
+      setBookIndexProgress(null);
+    }
+  }
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -683,6 +952,10 @@ export function App() {
       if (settingsOpen) {
         setSettingsOpen(false);
         window.setTimeout(() => settingsTriggerRef.current?.focus(), 0);
+        return;
+      }
+      if (anchorContextMenu) {
+        setAnchorContextMenu(null);
         return;
       }
       if (drawerMode) {
@@ -696,7 +969,7 @@ export function App() {
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [drawerMode, settingsOpen]);
+  }, [anchorContextMenu, drawerMode, settingsOpen]);
 
   useEffect(() => {
     if (!pdf) {
@@ -754,6 +1027,16 @@ export function App() {
   }, [draftSelection]);
 
   useEffect(() => {
+    if (!anchorContextMenu) return;
+    const closeMenu = (event: PointerEvent) => {
+      if (event.target instanceof Element && event.target.closest('.anchor-context-menu')) return;
+      setAnchorContextMenu(null);
+    };
+    document.addEventListener('pointerdown', closeMenu);
+    return () => document.removeEventListener('pointerdown', closeMenu);
+  }, [anchorContextMenu]);
+
+  useEffect(() => {
     if (!activeAnchor || !bridgeAvailable) {
       return;
     }
@@ -780,6 +1063,7 @@ export function App() {
     setSelectionText(anchor.quote);
     const anchorNotes = notesByAnchorId[anchor.id] ?? [];
     setNoteBody(draftBody ?? note?.body ?? anchorNotes.at(-1)?.body ?? '');
+    setNoteEditorOpen(Boolean(draftBody));
 
     if (!shouldScroll) {
       return;
@@ -810,14 +1094,54 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    const findAnchorElement = (x: number, y: number): HTMLElement | null => {
-      const candidates = document.elementsFromPoint(x, y);
-      for (const element of candidates) {
-        if (element instanceof HTMLElement && element.matches('.anchor-highlight')) {
-          return element;
+    const pageSurface = pageSurfaceRef.current;
+    if (!pageSurface || pageCount === 0) return;
+
+    let frame = 0;
+    const updateCurrentPage = () => {
+      frame = 0;
+      const surfaceTop = pageSurface.getBoundingClientRect().top;
+      const frames = Array.from(pageSurface.querySelectorAll<HTMLElement>('[data-page-index]'));
+      let current = 1;
+      for (const pageFrame of frames) {
+        const pageIndex = Number(pageFrame.dataset.pageIndex);
+        if (Number.isInteger(pageIndex) && pageFrame.getBoundingClientRect().top <= surfaceTop + 32) {
+          current = pageIndex + 1;
+        } else {
+          break;
         }
       }
-      return null;
+      setCurrentPage((previous) => previous === current ? previous : current);
+    };
+    const onScroll = () => {
+      if (!frame) frame = window.requestAnimationFrame(updateCurrentPage);
+    };
+
+    updateCurrentPage();
+    pageSurface.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      pageSurface.removeEventListener('scroll', onScroll);
+      if (frame) window.cancelAnimationFrame(frame);
+    };
+  }, [pageCount, scale]);
+
+  useEffect(() => {
+    const findAnchorElement = (x: number, y: number): HTMLElement | null => {
+      const candidates = Array.from(document.querySelectorAll<HTMLElement>('.anchor-highlight'));
+      let match: HTMLElement | null = null;
+      let matchArea = Number.POSITIVE_INFINITY;
+      for (const element of candidates) {
+        const rect = element.getBoundingClientRect();
+        if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) {
+          continue;
+        }
+        const area = rect.width * rect.height;
+        if (area < matchArea) {
+          match = element;
+          matchArea = area;
+        }
+      }
+      return match;
     };
 
     const activateFromClick = (element: HTMLElement) => {
@@ -825,7 +1149,7 @@ export function App() {
       if (!anchorId) return;
       const anchor = anchors.find((item) => item.id === anchorId);
       if (!anchor) return;
-      activateAnchor(anchor);
+      activateAnchor(anchor, false);
     };
 
     const onMouseDown = (event: MouseEvent) => {
@@ -871,18 +1195,41 @@ export function App() {
         });
         const frame = element?.closest('.page-frame');
         if (frame) frame.classList.add('has-highlight-hover');
+        const anchorId = element?.dataset.anchorId ?? null;
+        if (hoveredAnchorIdRef.current !== anchorId) {
+          hoveredAnchorIdRef.current = anchorId;
+          setHoveredAnchorId(anchorId);
+        }
       }, 0);
+    };
+
+    const onContextMenu = (event: MouseEvent) => {
+      const element = findAnchorElement(event.clientX, event.clientY);
+      if (!element) return;
+      const anchorId = element.dataset.anchorId;
+      const anchor = anchors.find((item) => item.id === anchorId);
+      if (!anchorId || !anchor) return;
+
+      event.preventDefault();
+      activateAnchor(anchor, false);
+      setAnchorContextMenu({
+        anchorId,
+        left: clamp(event.clientX, 8, Math.max(8, window.innerWidth - 190)),
+        top: clamp(event.clientY, 8, Math.max(8, window.innerHeight - 220))
+      });
     };
 
     document.addEventListener('mousedown', onMouseDown);
     document.addEventListener('mouseup', onMouseUp);
     document.addEventListener('dblclick', onDoubleClick);
     document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('contextmenu', onContextMenu);
     return () => {
       document.removeEventListener('mousedown', onMouseDown);
       document.removeEventListener('mouseup', onMouseUp);
       document.removeEventListener('dblclick', onDoubleClick);
       document.removeEventListener('mousemove', onMouseMove);
+      document.removeEventListener('contextmenu', onContextMenu);
       if (anchorClickTimerRef.current !== null) clearTimeout(anchorClickTimerRef.current);
       if (anchorHoverTimerRef.current !== null) clearTimeout(anchorHoverTimerRef.current);
     };
@@ -934,7 +1281,10 @@ export function App() {
       return;
     }
 
-    const onMouseUp = () => {
+    const onMouseUp = (event: MouseEvent) => {
+      if (event.target instanceof Element && event.target.closest('.drawer, .selection-action-bar')) {
+        return;
+      }
       const selection = window.getSelection();
       if (!selection || selection.isCollapsed) {
         setDraftSelection(null);
@@ -1042,6 +1392,7 @@ export function App() {
       setCurrentPage(1);
       setScale(DEFAULT_SCALE);
       restoredDocumentRef.current = null;
+      readingStateReadyRef.current = null;
        setAnchors([]);
        setNotesByAnchorId({});
         setActiveAnchor(null);
@@ -1068,6 +1419,7 @@ export function App() {
         setPdf(loaded);
         setPageCount(loaded.numPages);
         setCurrentPage(1);
+        readingStateReadyRef.current = null;
       }
     })().catch((error: unknown) => {
       if (!cancelled) {
@@ -1083,9 +1435,13 @@ export function App() {
   useEffect(() => {
     if (!openedDocument) {
       setConversationSessions([]);
+      setBookIndexStatus('missing');
       return;
     }
     void refreshConversationSessions(openedDocument.fingerprint);
+    void window.shuding.getBookIndexStatus(openedDocument.fingerprint).then(setBookIndexStatus).catch((error: unknown) => {
+      console.error('Unable to load book index status.', error);
+    });
   }, [openedDocument, refreshConversationSessions]);
 
   useEffect(() => {
@@ -1098,10 +1454,14 @@ export function App() {
     }
     let cancelled = false;
     void window.shuding.getReadingState(fingerprint).then((state) => {
-      if (cancelled || !state || openedDocumentRef.current?.fingerprint !== fingerprint) {
+      if (cancelled || openedDocumentRef.current?.fingerprint !== fingerprint) {
         return;
       }
-      restoredDocumentRef.current = fingerprint;
+      if (!state) {
+        restoredDocumentRef.current = fingerprint;
+        readingStateReadyRef.current = fingerprint;
+        return;
+      }
       if (state.scale >= MIN_SCALE && state.scale <= MAX_SCALE) {
         setScale(state.scale);
       }
@@ -1111,8 +1471,17 @@ export function App() {
       const restoreScroll = () => {
         const pageSurface = pageSurfaceRef.current;
         if (pageSurface) {
-          pageSurface.scrollTo({ top: Math.max(state.scrollTop ?? 0, 0), behavior: 'auto' });
+          const pageFrame = pageSurface.querySelector<HTMLElement>(`[data-page-index="${state.currentPage - 1}"]`);
+          const pageOffset = typeof state.pageOffset === 'number' && Number.isFinite(state.pageOffset)
+            ? Math.max(0, Math.min(1, state.pageOffset))
+            : null;
+          const restoredTop = pageFrame && pageOffset !== null
+            ? pageFrame.offsetTop + pageOffset * pageFrame.offsetHeight
+            : state.scrollTop ?? 0;
+          pageSurface.scrollTo({ top: Math.max(restoredTop, 0), behavior: 'auto' });
         }
+        restoredDocumentRef.current = fingerprint;
+        readingStateReadyRef.current = fingerprint;
       };
       window.requestAnimationFrame(() => {
         window.requestAnimationFrame(restoreScroll);
@@ -1130,13 +1499,20 @@ export function App() {
       return;
     }
     const fingerprint = openedDocument.fingerprint;
+    if (readingStateReadyRef.current !== fingerprint) {
+      return;
+    }
     if (readingSaveTimerRef.current) {
       clearTimeout(readingSaveTimerRef.current);
     }
     readingSaveTimerRef.current = setTimeout(() => {
       const pageSurface = pageSurfaceRef.current;
       const scrollTop = pageSurface?.scrollTop ?? 0;
-      void window.shuding.saveReadingState({ documentFingerprint: fingerprint, scale, currentPage, scrollTop }).catch((error: unknown) => {
+      const pageFrame = pageSurface?.querySelector<HTMLElement>(`[data-page-index="${Math.max(currentPage - 1, 0)}"]`);
+      const pageOffset = pageFrame && pageFrame.offsetHeight > 0
+        ? Math.max(0, Math.min(1, (scrollTop - pageFrame.offsetTop) / pageFrame.offsetHeight))
+        : undefined;
+      void window.shuding.saveReadingState({ documentFingerprint: fingerprint, scale, currentPage, scrollTop, pageOffset }).catch((error: unknown) => {
         console.error('Unable to save reading state.', error);
       });
     }, 400);
@@ -1234,17 +1610,27 @@ export function App() {
       setNoteSaveError('桌面桥接未加载。请完全重启开发应用后再试。');
       return;
     }
-
-    const body = noteBody.trim();
-    const currentDocumentId = openedDocumentRef.current?.fingerprint;
-    if (!body || !currentDocumentId) {
+    if (conversationRunning) {
+      setNoteSaveError('请先停止当前回答，再保存笔记。');
       return;
     }
 
-    const selectionToSave = draftSelection;
+    const body = noteBody.trim();
+    const currentDocumentId = openedDocumentRef.current?.fingerprint;
+    if (!body) {
+      setNoteSaveError('请输入笔记内容。');
+      return;
+    }
+    if (!currentDocumentId) {
+      setNoteSaveError('当前文档尚未准备好，请稍后再试。');
+      return;
+    }
+
+    const selectionToSave = draftSelectionRef.current ?? draftSelection;
     const anchorToUpdate = activeAnchor;
     if ((!selectionToSave || selectionToSave.documentId !== currentDocumentId) &&
       (!anchorToUpdate || anchorToUpdate.documentId !== currentDocumentId)) {
+      setNoteSaveError('当前选区已失效，请重新选中文本。');
       return;
     }
 
@@ -1253,6 +1639,48 @@ export function App() {
     setNoteSaved(false);
     let createdAnchor: Anchor | null = null;
     try {
+      const currentConversation = conversationRef.current;
+      const hasMatchingEphemeralConversation = Boolean(
+        selectionToSave &&
+        currentConversation?.context.kind === 'ephemeral-selection' &&
+        currentConversation.context.selection.documentFingerprint === selectionToSave.documentId &&
+        currentConversation.context.selection.pageIndex === selectionToSave.pageIndex &&
+        currentConversation.context.selection.quote === selectionToSave.quote
+      );
+
+      if (hasMatchingEphemeralConversation && currentConversation) {
+        const result = await window.shuding.finalizeEphemeral({
+          conversationId: currentConversation.conversationId,
+          documentFingerprint: currentDocumentId,
+          proposalId: pendingProposal?.conversationId === currentConversation.conversationId ? pendingProposal.id : undefined,
+          body
+        });
+        if (openedDocumentRef.current?.fingerprint !== currentDocumentId) return;
+        setAnchors((current) => [...current, result.anchor]);
+        if (result.note) {
+          setNotesByAnchorId((current) => ({
+            ...current,
+            [result.note!.anchorId]: [...(current[result.note!.anchorId] ?? []), result.note!]
+          }));
+        }
+        setActiveAnchor(result.anchor);
+        setSelectionText(result.anchor.quote);
+        setDraftSelection(null);
+        setSelectionPreview(null);
+        setSelectionActionPosition(null);
+        setActiveConversationContext({ kind: 'saved-anchor', anchorId: result.anchor.id });
+        setConversation((current) => current ? {
+          ...current,
+          context: { kind: 'saved-anchor', anchorId: result.anchor.id },
+          pendingProposal: null
+        } : current);
+        setPendingProposal(null);
+        setNoteEditorOpen(false);
+        setNoteSaved(true);
+        void refreshConversationSessions();
+        return;
+      }
+
       let anchor: Anchor;
       if (anchorToUpdate) {
         anchor = anchorToUpdate;
@@ -1288,11 +1716,14 @@ export function App() {
           setActiveAnchor(anchor);
           setSelectionText(anchor.quote);
           setDraftSelection(null);
+          setSelectionPreview(null);
+          setSelectionActionPosition(null);
         }
         setNotesByAnchorId((current) => ({
           ...current,
           [savedNote.anchorId]: [...(current[savedNote.anchorId] ?? []), savedNote]
         }));
+        setNoteEditorOpen(false);
         setNoteSaved(true);
       }
     } catch (error) {
@@ -1306,6 +1737,57 @@ export function App() {
       setNoteSaveError(`笔记保存失败：${details}`);
     } finally {
       setSaving(false);
+    }
+  }
+
+  function openDraftNoteEditor() {
+    setDrawerMode('note');
+    setNoteEditorOpen(true);
+    setNoteSaveError(null);
+    setNoteSaved(false);
+    setSelectionActionPosition(null);
+  }
+
+  async function saveDraftHighlight() {
+    if (!bridgeAvailable) {
+      setSelectionActionError('桌面桥接未加载，无法保存高亮。');
+      return;
+    }
+
+    const selection = draftSelectionRef.current;
+    const currentDocumentId = openedDocumentRef.current?.fingerprint;
+    if (!selection || !currentDocumentId || selection.documentId !== currentDocumentId) {
+      setSelectionActionError('所选文本已不属于当前文档。');
+      return;
+    }
+
+    setSelectionActionError(null);
+    try {
+      const anchor = await window.shuding.saveAnchor({
+        documentId: selection.documentId,
+        pageIndex: selection.pageIndex,
+        kind: 'text',
+        quote: selection.quote,
+        normalizedQuote: normalizeQuote(selection.quote),
+        pageRect: selection.pageRect,
+        normalizedRect: selection.normalizedRect
+      });
+
+      if (openedDocumentRef.current?.fingerprint !== currentDocumentId) {
+        await window.shuding.deleteAnchor({ anchorId: anchor.id });
+        return;
+      }
+
+      setAnchors((current) => [...current, anchor]);
+      setSelectionText(anchor.quote);
+      setDraftSelection(null);
+      setSelectionPreview(null);
+      setSelectionActionPosition(null);
+      window.getSelection()?.removeAllRanges();
+    } catch (error) {
+      console.error('Unable to save highlight.', error);
+      const details = error instanceof Error ? error.message : '未知错误';
+      setSelectionActionError(`高亮保存失败：${details}`);
     }
   }
 
@@ -1323,7 +1805,7 @@ export function App() {
     const previousConversation = conversationRef.current;
     const previousConversationId = conversationIdRef.current;
     if (previousConversationId && previousConversation?.context.kind === 'ephemeral-selection' && conversationRunningRef.current) {
-      if (!window.confirm('停止当前 AI 对话并改问新选区？')) {
+      if (!await requestConfirmation({ title: '切换 AI 对话？', message: '当前回答会被停止，并改为询问新选区。', confirmLabel: '切换对话' })) {
         return;
       }
       try {
@@ -1383,7 +1865,7 @@ export function App() {
       const savedAnchor = session.contextKind === 'saved-anchor'
         ? anchors.find((anchor) => anchor.documentId === session.documentFingerprint && anchor.pageIndex === session.pageIndex && normalizeQuote(anchor.quote) === normalizeQuote(session.quote))
         : null;
-      const context = cachedContext ?? (savedAnchor ? { kind: 'saved-anchor' as const, anchorId: savedAnchor.id } : null);
+      const context = cachedContext ?? (savedAnchor ? { kind: 'saved-anchor' as const, anchorId: savedAnchor.id } : session.contextKind === 'document' ? { kind: 'document' as const, documentFingerprint: session.documentFingerprint } : null);
       if (!context) {
         setConversationError('该对话上下文暂时无法恢复。');
         return;
@@ -1409,6 +1891,67 @@ export function App() {
     }
   }
 
+  async function openDocumentConversation() {
+    const documentFingerprint = openedDocumentRef.current?.fingerprint;
+    if (!bridgeAvailable || !documentFingerprint) {
+      setConversationError('请先打开一本书，再开始对话。');
+      return;
+    }
+    setAiView('chat');
+    setDrawerMode('ai');
+    try {
+      const snapshot = await window.shuding.openConversation({ kind: 'document', documentFingerprint });
+      if (openedDocumentRef.current?.fingerprint !== documentFingerprint) return;
+      activateConversation(snapshot);
+      await refreshConversationSessions();
+    } catch (error: unknown) {
+      setConversationError(`对话无法打开：${error instanceof Error ? error.message : '未知错误'}`);
+    }
+  }
+
+  async function openFreshDocumentConversation() {
+    const documentFingerprint = openedDocumentRef.current?.fingerprint;
+    if (!bridgeAvailable || !documentFingerprint) return;
+    try {
+      const snapshot = await window.shuding.openConversation({ kind: 'document', documentFingerprint, fresh: true });
+      if (openedDocumentRef.current?.fingerprint !== documentFingerprint) return;
+      activateConversation(snapshot);
+      setAiView('chat');
+      setDrawerMode('ai');
+      await refreshConversationSessions();
+    } catch (error: unknown) {
+      setConversationError(`新建对话失败：${error instanceof Error ? error.message : '未知错误'}`);
+    }
+  }
+
+  async function clearDocumentConversation() {
+    const current = conversationRef.current;
+    if (!current || current.context.kind !== 'document' || !bridgeAvailable) return;
+    if (conversationRunningRef.current) {
+      setConversationError('请先停止当前回答，再清除对话上下文。');
+      return;
+    }
+    try {
+      await window.shuding.deleteConversationSession(current.conversationId);
+      conversationSnapshotsRef.current.delete(current.conversationId);
+      await openFreshDocumentConversation();
+    } catch (error: unknown) {
+      setConversationError(`清除上下文失败：${error instanceof Error ? error.message : '未知错误'}`);
+    }
+  }
+
+  async function retryBookIndexConsent() {
+    const documentFingerprint = openedDocumentRef.current?.fingerprint;
+    if (!documentFingerprint || !bridgeAvailable) return;
+    try {
+      await window.shuding.resetBookIndexStatus(documentFingerprint);
+      setBookIndexStatus('missing');
+      setBookIndexConsent({ conversationId: conversationIdRef.current ?? '', documentFingerprint, estimatedDiskBytes: 80 * 1024 * 1024 });
+    } catch (error: unknown) {
+      setConversationError(`无法重新请求索引授权：${error instanceof Error ? error.message : '未知错误'}`);
+    }
+  }
+
   async function copyDraftSelection() {
     if (!draftSelection) {
       return;
@@ -1423,6 +1966,51 @@ export function App() {
     }
   }
 
+  async function copyAnchorQuote(anchor: Anchor) {
+    try {
+      await navigator.clipboard.writeText(anchor.quote);
+      setSelectionActionError(null);
+    } catch (error) {
+      console.error('Unable to copy anchor text.', error);
+      setSelectionActionError('无法复制高亮文本。');
+    } finally {
+      setAnchorContextMenu(null);
+    }
+  }
+
+  function openAnchorNotes(anchor: Anchor) {
+    activateAnchor(anchor, false);
+    setDrawerMode('note');
+    setAnchorContextMenu(null);
+  }
+
+  async function openAnchorConversation(anchor: Anchor) {
+    activateAnchor(anchor, false);
+    setAiView('chat');
+    setDrawerMode('ai');
+    setAnchorContextMenu(null);
+    if (!bridgeAvailable) {
+      setConversationError('桌面桥接未加载，无法打开 AI 对话。');
+      return;
+    }
+    try {
+      const snapshot = await window.shuding.openConversation({ kind: 'saved-anchor', anchorId: anchor.id });
+      if (openedDocumentRef.current?.fingerprint !== anchor.documentId) return;
+      activateConversation(snapshot);
+      await refreshConversationSessions();
+    } catch (error: unknown) {
+      setConversationError(`对话无法打开：${error instanceof Error ? error.message : '未知错误'}`);
+    }
+  }
+
+  function toggleDocumentConversation() {
+    if (drawerMode === 'ai' && conversation?.context.kind === 'document') {
+      setDrawerMode(null);
+      return;
+    }
+    void openDocumentConversation();
+  }
+
   function toggleDrawer(mode: Exclude<DrawerMode, null>) {
     setDrawerMode((current) => {
       const next = current === mode ? null : mode;
@@ -1431,9 +2019,7 @@ export function App() {
       }
       return next;
     });
-    if (mode === 'ai') {
-      void refreshConversationSessions();
-    }
+    if (mode === 'ai') void refreshConversationSessions();
   }
 
   function startDrawerResize(event: React.PointerEvent<HTMLDivElement>) {
@@ -1463,7 +2049,18 @@ export function App() {
   }
 
   async function deleteCurrentAnchor(anchor: Anchor) {
-    if (!window.confirm('删除这条引用？其笔记和与之关联的 AI 对话也会一并删除。')) {
+    const hasNotes = notesForAnchor(anchor.id).length > 0;
+    const hasConversation = conversationSessions.some((session) => (
+      session.contextKind === 'saved-anchor' &&
+      session.documentFingerprint === anchor.documentId &&
+      session.pageIndex === anchor.pageIndex &&
+      normalizeQuote(session.quote) === normalizeQuote(anchor.quote)
+    )) || (
+      conversationRef.current?.context.kind === 'saved-anchor' &&
+      conversationRef.current.context.anchorId === anchor.id
+    );
+
+    if ((hasNotes || hasConversation) && !await requestConfirmation({ title: '删除这条高亮？', message: '关联的笔记和 AI 对话也会一并删除，此操作无法撤销。', confirmLabel: '删除高亮' })) {
       return;
     }
 
@@ -1511,13 +2108,13 @@ export function App() {
     }
   }
 
-  async function sendConversationMessage() {
-    if (!conversationId || !conversationDraft.trim() || conversationRunning || !bridgeAvailable) {
+  async function sendConversationMessage(contentOverride?: string) {
+    const content = (contentOverride ?? conversationDraft).trim();
+    if (!conversationId || !content || conversationRunning || !bridgeAvailable) {
       return;
     }
     const currentConversationId = conversationId;
     const currentConversation = conversation;
-    const content = conversationDraft.trim();
     setConversationDraft('');
     setConversationError(null);
     setAssistantDraft('');
@@ -1535,7 +2132,11 @@ export function App() {
     try {
       await window.shuding.sendConversationMessage({ conversationId: currentConversationId, content });
       if (conversationIdRef.current !== currentConversationId) return;
-      if (currentConversation?.context.kind === 'saved-anchor') {
+      // Both saved anchors and whole-document conversations are persisted by
+      // the main process. Reload them so the completed assistant message is
+      // read from the source of truth; only an ephemeral selection lives solely
+      // in this renderer and needs the streaming draft appended here.
+      if (currentConversation && currentConversation.context.kind !== 'ephemeral-selection') {
         const snapshot = await window.shuding.openConversation(currentConversation.context);
         if (conversationIdRef.current !== currentConversationId) return;
         activateConversation(snapshot);
@@ -1560,23 +2161,220 @@ export function App() {
     }
   }
 
-  async function confirmProposal() {
-    if (!pendingProposal || !bridgeAvailable) {
+  // Voice events are installed once, while this function is recreated with the
+  // current conversation. Keep the latest sender available to that listener.
+  sendConversationMessageRef.current = sendConversationMessage;
+
+  function stopSpeechRecognition() {
+    if (speechStateRef.current !== 'listening') return;
+    setSpeechRecognitionState('transcribing');
+    audioWorkletRef.current?.port.postMessage('flush');
+    window.setTimeout(() => {
+      audioSourceRef.current?.disconnect();
+      audioWorkletRef.current?.disconnect();
+      mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+      void audioContextRef.current?.close();
+      void voiceChunkQueueRef.current.then(() => window.shuding.stopVoiceStream()).catch((error: unknown) => {
+        speechAutoSendRef.current = false;
+        setSpeechRecognitionError(`无法结束实时听写：${error instanceof Error ? error.message : '未知错误'}`);
+        setSpeechRecognitionState('idle');
+      });
+    }, 30);
+  }
+
+  function startSpeechRecognition(pushToTalk = false) {
+    void (async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+        if (pushToTalk && !pushToTalkHeldRef.current) {
+          stream.getTracks().forEach((track) => track.stop());
+          speechAutoSendRef.current = false;
+          return;
+        }
+        await window.shuding.startVoiceStream();
+        const context = new AudioContext();
+        await context.audioWorklet.addModule(new URL('../audio/pcm-worklet.js', import.meta.url));
+        const source = context.createMediaStreamSource(stream);
+        const worklet = new AudioWorkletNode(context, 'pcm-capture');
+        speechBaseDraftRef.current = conversationDraft;
+        speechCommittedRef.current = '';
+        voiceChunkQueueRef.current = Promise.resolve();
+        worklet.port.onmessage = (event: MessageEvent<Float32Array>) => {
+          const audio = event.data.slice().buffer as ArrayBuffer;
+          voiceChunkQueueRef.current = voiceChunkQueueRef.current
+            .then(() => window.shuding.pushVoiceAudio(audio))
+            .catch((error: unknown) => setSpeechRecognitionError(`实时音频传输失败：${error instanceof Error ? error.message : '未知错误'}`));
+        };
+        source.connect(worklet);
+        worklet.connect(context.destination);
+        mediaStreamRef.current = stream;
+        audioContextRef.current = context;
+        audioSourceRef.current = source;
+        audioWorkletRef.current = worklet;
+        setSpeechRecognitionError(null);
+        setSpeechRecognitionState('listening');
+      } catch (error) {
+        setSpeechRecognitionError(`无法开始实时听写：${error instanceof Error ? error.message : '未获得麦克风权限'}`);
+        setSpeechRecognitionState('idle');
+      }
+    })();
+  }
+
+  async function startPagePushToTalk() {
+    const document = openedDocumentRef.current;
+    const page = currentPage;
+    if (!bridgeAvailable || !document || !pdf || !aiSettings?.hasApiKey) {
+      setSpeechRecognitionError('请先打开 PDF 并配置 AI，再使用按住 Y 提问。');
       return;
     }
+    if (conversationRunningRef.current) {
+      setSpeechRecognitionError('请等待当前回答完成后，再按住 Y 继续提问。');
+      return;
+    }
+    try {
+      let snapshot = conversationRef.current;
+      const isCurrentPageVoiceSession = snapshot?.context.kind === 'ephemeral-selection' &&
+        snapshot.context.selection.mode === 'voice-page' &&
+        snapshot.context.selection.documentFingerprint === document.fingerprint &&
+        snapshot.context.selection.pageIndex === page - 1;
+      if (!isCurrentPageVoiceSession) {
+        const pdfPage = await pdf.getPage(page);
+        const content = await pdfPage.getTextContent();
+        pdfPage.cleanup();
+        const quote = content.items.map((item) => 'str' in item ? item.str : '').join(' ').replace(/\s+/g, ' ').trim();
+        if (quote.length < 8) throw new Error('当前页没有可定位的文本');
+        snapshot = await window.shuding.openConversation({
+          kind: 'ephemeral-selection',
+          selection: {
+            documentFingerprint: document.fingerprint,
+            pageIndex: page - 1,
+            quote: quote.slice(0, 8_000),
+            normalizedQuote: normalizeQuote(quote.slice(0, 8_000)),
+            pageRect: { x: 0, y: 0, width: 1, height: 1 },
+            normalizedRect: { x: 0, y: 0, width: 1, height: 1 },
+            mode: 'voice-page'
+          }
+        });
+      }
+      if (openedDocumentRef.current?.fingerprint !== document.fingerprint || !snapshot) return;
+      activateConversation(snapshot);
+      setAiView('chat');
+      setDrawerMode('ai');
+      setConversationDraft('');
+      speechAutoSendRef.current = true;
+      if (!pushToTalkHeldRef.current) {
+        speechAutoSendRef.current = false;
+        return;
+      }
+      startSpeechRecognition(true);
+    } catch (error: unknown) {
+      speechAutoSendRef.current = false;
+      setSpeechRecognitionError(`无法开始当前页语音提问：${error instanceof Error ? error.message : '未知错误'}`);
+    }
+  }
+
+  useEffect(() => {
+    const isEditable = (target: EventTarget | null) => target instanceof HTMLElement && (
+      target.isContentEditable || target.tagName === 'TEXTAREA' || target.tagName === 'INPUT' || target.tagName === 'SELECT'
+    );
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.code !== 'KeyY' || event.repeat || isEditable(event.target) || pushToTalkHeldRef.current) return;
+      pushToTalkHeldRef.current = true;
+      event.preventDefault();
+      void startPagePushToTalk();
+    };
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (event.code !== 'KeyY' || !pushToTalkHeldRef.current) return;
+      pushToTalkHeldRef.current = false;
+      event.preventDefault();
+      stopSpeechRecognition();
+    };
+    const onBlur = () => {
+      if (!pushToTalkHeldRef.current) return;
+      pushToTalkHeldRef.current = false;
+      stopSpeechRecognition();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', onBlur);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', onBlur);
+    };
+  }, [aiSettings?.hasApiKey, bridgeAvailable, currentPage, pdf]);
+
+  function toggleSpeechRecognition() {
+    if (speechRecognitionState === 'idle') {
+      startSpeechRecognition();
+      return;
+    }
+    stopSpeechRecognition();
+  }
+
+  async function acceptProposal() {
+    if (!pendingProposal || !bridgeAvailable || !conversation) {
+      return;
+    }
+
+    if (conversationRunning) {
+      setConversationError('请先停止当前回答，再保存这条笔记。');
+      return;
+    }
+
     setSavingProposal(true);
     setConversationError(null);
     try {
-      const savedNote = await window.shuding.confirmNoteProposal({
-        conversationId: pendingProposal.conversationId,
-        proposalId: pendingProposal.id
-      });
-      setNotesByAnchorId((current) => ({
-        ...current,
-        [savedNote.anchorId]: [...(current[savedNote.anchorId] ?? []), savedNote]
-      }));
-      setPendingProposal(null);
-      void refreshConversationSessions();
+      if (conversation.context.kind === 'ephemeral-selection') {
+        const documentFingerprint = openedDocumentRef.current?.fingerprint;
+        const body = ephemeralSummary.trim() || pendingProposal.body;
+        if (!documentFingerprint || documentFingerprint !== conversation.context.selection.documentFingerprint) {
+          setConversationError('当前文档已更改，无法保存这条笔记。');
+          return;
+        }
+
+        const result = await window.shuding.finalizeEphemeral({
+          conversationId: pendingProposal.conversationId,
+          documentFingerprint,
+          proposalId: pendingProposal.id,
+          body
+        });
+        if (openedDocumentRef.current?.fingerprint !== documentFingerprint) {
+          return;
+        }
+        setAnchors((current) => [...current, result.anchor]);
+        if (result.note) {
+          setNotesByAnchorId((current) => ({
+            ...current,
+            [result.note!.anchorId]: [...(current[result.note!.anchorId] ?? []), result.note!]
+          }));
+        }
+        setActiveAnchor(result.anchor);
+        setSelectionText(result.anchor.quote);
+        setDraftSelection(null);
+        setSelectionActionPosition(null);
+        setActiveConversationContext({ kind: 'saved-anchor', anchorId: result.anchor.id });
+        setConversation((current) => current ? {
+          ...current,
+          context: { kind: 'saved-anchor', anchorId: result.anchor.id },
+          pendingProposal: null
+        } : current);
+        setPendingProposal(null);
+        setEphemeralSummary('');
+        void refreshConversationSessions();
+      } else {
+        const savedNote = await window.shuding.confirmNoteProposal({
+          conversationId: pendingProposal.conversationId,
+          proposalId: pendingProposal.id
+        });
+        setNotesByAnchorId((current) => ({
+          ...current,
+          [savedNote.anchorId]: [...(current[savedNote.anchorId] ?? []), savedNote]
+        }));
+        setConversation((current) => current ? { ...current, pendingProposal: null } : current);
+        setPendingProposal(null);
+        void refreshConversationSessions();
+      }
     } catch (error: unknown) {
       const details = error instanceof Error ? error.message : '未知错误';
       setConversationError(`保存建议失败：${details}`);
@@ -1589,10 +2387,12 @@ export function App() {
     if (!pendingProposal || !bridgeAvailable) {
       return;
     }
+
     try {
       await window.shuding.discardNoteProposal(pendingProposal.id);
+      setConversation((current) => current ? { ...current, pendingProposal: null } : current);
       setPendingProposal(null);
-      void refreshConversationSessions();
+      setEphemeralSummary('');
     } catch (error: unknown) {
       const details = error instanceof Error ? error.message : '未知错误';
       setConversationError(`丢弃建议失败：${details}`);
@@ -1603,7 +2403,7 @@ export function App() {
     if (!bridgeAvailable) {
       return;
     }
-    if (!window.confirm('删除这条 AI 对话？其引用与笔记将保留。')) {
+    if (!await requestConfirmation({ title: '删除这条 AI 对话？', message: '引用和笔记会保留，但对话记录无法恢复。', confirmLabel: '删除对话' })) {
       return;
     }
     try {
@@ -1623,6 +2423,9 @@ export function App() {
     if (!bridgeAvailable) {
       return;
     }
+    if (!await requestConfirmation({ title: '删除这条笔记？', message: '删除后无法恢复。', confirmLabel: '删除笔记' })) {
+      return;
+    }
     try {
       await window.shuding.deleteNote(noteId);
       setNotesByAnchorId((current) => ({
@@ -1632,65 +2435,6 @@ export function App() {
     } catch (error: unknown) {
       const details = error instanceof Error ? error.message : '未知错误';
       setNoteSaveError(`删除笔记失败：${details}`);
-    }
-  }
-
-  async function finalizeEphemeral(saveSummary: boolean) {
-    if (!conversationId || conversation?.context.kind !== 'ephemeral-selection' || !bridgeAvailable) return;
-    const currentConversationId = conversationId;
-    const documentFingerprint = openedDocumentRef.current?.fingerprint;
-    if (!documentFingerprint || documentFingerprint !== conversation.context.selection.documentFingerprint) {
-      setConversationError('当前文档已更改，无法保存临时对话引用。');
-      return;
-    }
-    const body = saveSummary ? (ephemeralSummary.trim() || pendingProposal?.body) : undefined;
-    if (saveSummary && !body) {
-      setConversationError('请输入或先生成要保存的笔记摘要。');
-      return;
-    }
-    setSavingProposal(true);
-    setConversationError(null);
-    try {
-      const result = await window.shuding.finalizeEphemeral({
-        conversationId: currentConversationId,
-        documentFingerprint,
-        ...(saveSummary ? { body, proposalId: pendingProposal?.id } : {})
-      });
-      if (conversationIdRef.current !== currentConversationId || openedDocumentRef.current?.fingerprint !== documentFingerprint) return;
-      setAnchors((current) => [...current, result.anchor]);
-      if (result.note) {
-        setNotesByAnchorId((current) => ({ ...current, [result.note!.anchorId]: [...(current[result.note!.anchorId] ?? []), result.note!] }));
-      }
-      setActiveAnchor(result.anchor);
-      setSelectionText(result.anchor.quote);
-      setDraftSelection(null);
-      setSelectionActionPosition(null);
-      clearEphemeralConversationLocal();
-      setConversationNotice('临时对话未保存到引用历史；已保存的引用可继续开始新对话。');
-      void refreshConversationSessions();
-    } catch (error: unknown) {
-      const details = error instanceof Error ? error.message : '未知错误';
-      if (conversationIdRef.current === currentConversationId) setConversationError(`保存临时对话失败：${details}`);
-    } finally {
-      setSavingProposal(false);
-    }
-  }
-
-  async function discardEphemeralConversation() {
-    if (!conversationId || conversation?.context.kind !== 'ephemeral-selection' || !bridgeAvailable) return;
-    const currentConversationId = conversationId;
-    clearEphemeralConversationLocal();
-    setDrawerMode(null);
-    try {
-      await window.shuding.discardConversation(currentConversationId);
-      conversationSnapshotsRef.current.delete(currentConversationId);
-      await refreshConversationSessions();
-      if (!draftSelectionRef.current) {
-        setSelectionText('选中一句话后在这里生成锚点');
-      }
-    } catch (error: unknown) {
-      const details = error instanceof Error ? error.message : '未知错误';
-      setSelectionActionError(`临时对话清理失败：${details}`);
     }
   }
 
@@ -1767,6 +2511,16 @@ export function App() {
               {sidebarCollapsed ? '☰' : '☰'}
             </button>
             <div className="doc-meta">{pageCount > 0 ? `第 ${currentPage} / ${pageCount} 页` : '等待导入 PDF'}</div>
+            <button
+              type="button"
+              className="reading-back-button"
+              onClick={restorePreviousReadingPosition}
+              disabled={navigationHistoryRef.current.length === 0}
+              title="返回上一个阅读位置（Alt/⌘/Ctrl + ←）"
+              aria-label="返回上一个阅读位置"
+            >
+              ↶
+            </button>
           </div>
           <div className="topbar-actions">
             <div className="drawer-controls" aria-label="阅读工具">
@@ -1790,7 +2544,7 @@ export function App() {
                 type="button"
                 aria-expanded={drawerMode === 'ai'}
                 aria-controls="contextual-drawer"
-                onClick={() => toggleDrawer('ai')}
+                onClick={toggleDocumentConversation}
               >
                 AI
               </button>
@@ -1812,6 +2566,13 @@ export function App() {
           </div>
         </header>
 
+        {navigationNotice ? (
+          <div className="navigation-notice" role="status" aria-live="polite">
+            <span>已跳转到第 {navigationNotice.page} 页</span>
+            {navigationNotice.reason ? <small>{navigationNotice.reason}</small> : null}
+          </div>
+        ) : null}
+
         <section className="page-surface" ref={pageSurfaceRef}>
           {!pdf ? (
             <div className="page-placeholder">
@@ -1830,13 +2591,14 @@ export function App() {
                   renderPriority={pageRenderPriorities.get(pageIndex)}
                   scrollRootRef={pageSurfaceRef}
                   anchors={anchors.filter((anchor) => anchor.pageIndex === pageIndex)}
-                   activeAnchorId={activeAnchor?.id ?? null}
-                   draftRects={selectionPreview?.pageIndex === pageIndex
-                     ? selectionPreview.rects
-                     : draftSelection?.pageIndex === pageIndex
-                       ? draftSelection.normalizedClientRects
-                       : []}
-                  onVisible={setCurrentPage}
+                  notesByAnchorId={notesByAnchorId}
+                  activeAnchorId={activeAnchor?.id ?? null}
+                  hoveredAnchorId={hoveredAnchorId}
+                  draftRects={selectionPreview?.pageIndex === pageIndex
+                    ? selectionPreview.rects
+                    : draftSelection?.pageIndex === pageIndex
+                      ? draftSelection.normalizedClientRects
+                      : []}
                   onViewportChange={onViewportChange}
                 />
               ))}
@@ -1863,7 +2625,14 @@ export function App() {
         </div>
         {!bridgeAvailable ? <div className="bridge-error">桌面桥接未加载，笔记无法保存。请完全重启应用。</div> : null}
         {drawerMode === 'annotations' ? (
-          <section className="drawer-section">
+          <section className="drawer-section annotation-panel">
+          <div className="annotation-panel-heading">
+            <div>
+              <p>文档标注</p>
+              <strong>{anchors.length} 条高亮</strong>
+            </div>
+            {activeAnchor ? <span>当前：第 {activeAnchor.pageIndex + 1} 页</span> : null}
+          </div>
           <div className="annotation-list">
           {anchors.map((anchor) => {
               const anchorNotes = notesForAnchor(anchor.id);
@@ -1875,14 +2644,17 @@ export function App() {
                       type="button"
                       onClick={() => activateAnchor(anchor)}
                     >
-                      <span>{normalizeQuote(anchor.quote)}</span>
-                      <small>页 {anchor.pageIndex + 1} · {anchorNotes.length} 条笔记</small>
+                      <span className="annotation-page">{anchor.pageIndex + 1}</span>
+                      <span className="annotation-copy">
+                        <span className="annotation-quote">{normalizeQuote(anchor.quote)}</span>
+                        <small>{anchorNotes.length > 0 ? `${anchorNotes.length} 条笔记` : '未添加笔记'}</small>
+                      </span>
                     </button>
                     <button className="delete-anchor" type="button" onClick={() => void deleteCurrentAnchor(anchor)} aria-label="删除标注">
                       删除
                     </button>
                   </div>
-                  {anchorNotes.map((note) => (
+                  {anchorNotes.slice(-2).map((note) => (
                     <div className="annotation-note-row" key={note.id}>
                       <button
                         className={`annotation-note${anchor.id === activeAnchor?.id && note.body === noteBody ? ' active' : ''}`}
@@ -1901,6 +2673,7 @@ export function App() {
                       </button>
                     </div>
                   ))}
+                  {anchorNotes.length > 2 ? <p className="annotation-more-notes">还有 {anchorNotes.length - 2} 条笔记</p> : null}
                 </div>
               );
             })}
@@ -1913,40 +2686,64 @@ export function App() {
           <>
           {(activeAnchor || draftSelection) ? (
             <section className="quote-context">
-              <p className="quote-context-label">当前引用</p>
-              <p>{summary}</p>
-              {activeAnchor ? <p className="anchor-meta">页 {activeAnchor.pageIndex + 1} · {activeAnchor.kind}</p> : null}
+              <div className="quote-context-heading">
+                <p className="quote-context-label">当前高亮</p>
+                {activeAnchor ? <span className="anchor-meta">第 {activeAnchor.pageIndex + 1} 页</span> : draftSelection ? <span className="anchor-meta">临时选区</span> : null}
+              </div>
+              <p className="quote-context-preview">{summary}</p>
+              {activeAnchor ? <span className="quote-context-kind">{activeAnchor.kind === 'text' ? '文本高亮' : activeAnchor.kind}</span> : null}
             </section>
           ) : null}
-          <section className="drawer-section note-composer">
-          <h3>手动笔记</h3>
-          <textarea value={noteBody} onChange={(event) => setNoteBody(event.target.value)} placeholder="在这里记录这一段的想法" />
-          <button className="primary full note-save" type="button" onClick={() => void saveCurrentNote()} disabled={(!activeAnchor && !draftSelection) || !noteBody.trim() || saving}>
-            {saving ? '保存中' : '保存笔记'}
-          </button>
-          {noteSaveError ? <p className="note-status error">{noteSaveError}</p> : null}
-          {noteSaved ? <p className="note-status">已保存</p> : null}
-          {activeAnchor ? (
-            <div className="saved-notes">
-              <h3>已保存笔记</h3>
-              {notesForAnchor(activeAnchor.id).map((note) => (
-                <div className="annotation-note-row" key={note.id}>
-                  <button className="annotation-note" type="button" onClick={() => activateAnchor(activeAnchor, false, note)}>
-                    {note.body}
-                  </button>
-                  <button
-                    className="note-delete"
-                    type="button"
-                    aria-label="删除这条笔记"
-                    onClick={() => void deleteNoteForAnchor(note.id, activeAnchor.id)}
-                  >
-                    ✕
+          <section className="drawer-section note-panel">
+            <div className="note-panel-scroll">
+              <div className="note-list-heading">
+                <h3>笔记</h3>
+                {activeAnchor ? <span>{notesForAnchor(activeAnchor.id).length} 条</span> : null}
+              </div>
+              {activeAnchor && notesForAnchor(activeAnchor.id).length > 0 ? (
+                <div className="note-card-list">
+                  {notesForAnchor(activeAnchor.id).map((note) => (
+                    <article className="note-card" key={note.id}>
+                      <div className="note-card-header">
+                        <span>手动笔记</span>
+                        <time dateTime={note.updatedAt}>{formatSessionTime(note.updatedAt)}</time>
+                      </div>
+                      <p>{note.body}</p>
+                      <button
+                        className="note-card-delete"
+                        type="button"
+                        aria-label="删除这条笔记"
+                        onClick={() => void deleteNoteForAnchor(note.id, activeAnchor.id)}
+                      >
+                        删除
+                      </button>
+                    </article>
+                  ))}
+                </div>
+              ) : (
+                <div className="note-empty-state">
+                  <strong>{activeAnchor ? '这条高亮还没有笔记' : '先选中一段文字'}</strong>
+                  <span>{activeAnchor ? '记录你对这段内容的理解' : '笔记会和高亮一起保存'}</span>
+                </div>
+              )}
+            </div>
+            {noteEditorOpen ? (
+              <div className="note-editor">
+                <textarea autoFocus value={noteBody} onChange={(event) => setNoteBody(event.target.value)} placeholder="记录你对这段内容的理解" />
+                <div className="note-editor-actions">
+                  <button type="button" onClick={() => { setNoteEditorOpen(false); setNoteBody(activeAnchor ? notesForAnchor(activeAnchor.id).at(-1)?.body ?? '' : ''); }}>取消</button>
+                  <button className="primary" type="button" onClick={() => void saveCurrentNote()} disabled={(!activeAnchor && !draftSelection) || !noteBody.trim() || saving || conversationRunning}>
+                    {saving ? '保存中' : '保存笔记'}
                   </button>
                 </div>
-              ))}
-              {notesForAnchor(activeAnchor.id).length === 0 ? <p className="annotation-empty">当前引用还没有手动笔记。</p> : null}
-            </div>
-          ) : null}
+                {noteSaveError ? <p className="note-status error">{noteSaveError}</p> : null}
+              </div>
+            ) : (
+              <button className="add-note-button" type="button" onClick={() => { setNoteEditorOpen(true); setNoteSaveError(null); setNoteSaved(false); }} disabled={!activeAnchor && !draftSelection}>
+                <span aria-hidden="true">+</span> 添加笔记
+              </button>
+            )}
+            {noteSaved && !noteEditorOpen ? <p className="note-status">已保存</p> : null}
           </section>
           </>
         ) : null}
@@ -1994,8 +2791,8 @@ export function App() {
                         onClick={() => void openConversationSession(session)}
                         aria-current={session.conversationId === conversationId ? 'true' : undefined}
                       >
-                        <span className="session-quote">{normalizeQuote(session.quote)}</span>
-                        <small>页 {session.pageIndex + 1} · {formatSessionTime(session.lastUsedAt)} · {session.status === 'running' ? '运行中' : '已暂停'}</small>
+                        <span className="session-quote">{session.contextKind === 'document' ? '整本书对话' : normalizeQuote(session.quote)}</span>
+                        <small>{session.contextKind === 'document' ? '未绑定引用' : `页 ${session.pageIndex + 1} · `}{formatSessionTime(session.lastUsedAt)} · {session.status === 'running' ? '运行中' : '已暂停'}</small>
                       </button>
                       <button
                         className="session-delete"
@@ -2040,10 +2837,22 @@ export function App() {
               >
                 {quoteExpanded ? '收起' : '展开'}
               </button>
+              <button type="button" className="quote-expand-toggle quote-detach-toggle" onClick={() => void openDocumentConversation()}>
+                取消引用
+              </button>
             </section>
           ) : null}
           {conversation ? (
           <section className="drawer-section conversation-panel">
+            {conversation.context.kind === 'document' ? (
+              <div className="document-conversation-toolbar" aria-label="整本书对话操作">
+                <span className="document-conversation-title">整本书对话</span>
+                <div className="document-conversation-actions">
+                  <button type="button" title="新建一段整本书对话" aria-label="新建对话" onClick={() => void openFreshDocumentConversation()} disabled={conversationRunning}>＋</button>
+                  <button type="button" title="清除当前对话上下文" aria-label="清除上下文" onClick={() => void clearDocumentConversation()} disabled={conversationRunning}>⌫</button>
+                </div>
+              </div>
+            ) : null}
             <div className="conversation-messages" aria-live="polite">
               {conversation?.messages.map((message: ConversationMessage) => (
                 <div className={`conversation-message ${message.role}`} key={message.id}>
@@ -2057,8 +2866,20 @@ export function App() {
               {!conversation && !conversationError ? <p className="annotation-empty">正在加载对话。</p> : null}
             </div>
             {toolStatus ? <p className="note-status">{toolStatus}</p> : null}
-            {conversationNotice ? <p className="note-status">{conversationNotice}</p> : null}
-            <textarea value={conversationDraft} onChange={(event) => setConversationDraft(event.target.value)} placeholder="围绕当前引用提问" disabled={conversationRunning} />
+            <div className="conversation-input">
+              <textarea value={conversationDraft} onChange={(event) => setConversationDraft(event.target.value)} placeholder={conversation.context.kind === 'document' ? '向这本书提问，或请 Harness 帮你查找内容' : '围绕当前引用提问'} disabled={conversationRunning || speechRecognitionState !== 'idle'} />
+              <button
+                className={`speech-input-button${speechRecognitionState !== 'idle' ? ' listening' : ''}`}
+                type="button"
+                onClick={toggleSpeechRecognition}
+                disabled={conversationRunning || !aiSettings?.hasApiKey || speechRecognitionState === 'transcribing'}
+                aria-label={speechRecognitionState === 'idle' ? '开始语音输入' : '停止语音输入'}
+                title={speechRecognitionState === 'idle' ? '开始语音输入' : '停止语音输入'}
+              >
+                <span aria-hidden="true">{speechRecognitionState === 'listening' ? '■' : '🎙'}</span>
+              </button>
+            </div>
+            {speechRecognitionState === 'listening' ? <p className="voice-status" role="status">正在实时听写，临时结果会随语音修正</p> : speechRecognitionState === 'transcribing' ? <p className="voice-status" role="status">正在生成最终转写…</p> : null}
             <div className="conversation-actions">
               <button className="primary" type="button" onClick={() => void sendConversationMessage()} disabled={conversationRunning || !conversationDraft.trim() || !aiSettings?.hasApiKey}>
                 发送
@@ -2068,32 +2889,56 @@ export function App() {
               </button>
             </div>
             {!aiSettings?.hasApiKey ? <p className="note-status error">保存安全 API Key 后即可开始对话。</p> : null}
+            {speechRecognitionError ? <p className="note-status error">{speechRecognitionError}</p> : null}
             {conversationError ? <p className="note-status error">{conversationError}</p> : null}
             {pendingProposal ? (
               <div className="proposal-preview">
                 <h3>AI 笔记建议</h3>
-             {conversation.context.kind === 'ephemeral-selection' ? (
-                  <textarea value={ephemeralSummary} onChange={(event) => setEphemeralSummary(event.target.value)} placeholder={pendingProposal.body} />
+                {conversation.context.kind === 'ephemeral-selection' ? (
+                  <textarea
+                    value={ephemeralSummary}
+                    onChange={(event) => setEphemeralSummary(event.target.value)}
+                    placeholder={pendingProposal.body}
+                    aria-label="编辑 AI 笔记建议"
+                  />
                 ) : <p>{pendingProposal.body}</p>}
                 <div className="conversation-actions">
-                  {conversation.context.kind === 'ephemeral-selection' ? (
-                    <button className="primary" type="button" onClick={() => void finalizeEphemeral(true)} disabled={savingProposal}>
-                      {savingProposal ? '保存中' : '保存摘要为笔记'}
-                    </button>
-                  ) : (
-                    <button className="primary" type="button" onClick={() => void confirmProposal()} disabled={savingProposal}>
-                      {savingProposal ? '保存中' : '保存为笔记'}
-                    </button>
-                  )}
-                  <button type="button" onClick={() => void discardProposal()} disabled={savingProposal}>丢弃</button>
+                  <button className="primary" type="button" onClick={() => void acceptProposal()} disabled={savingProposal || conversationRunning}>
+                    {savingProposal ? '加入中' : '加入笔记'}
+                  </button>
+                  <button type="button" onClick={() => void discardProposal()} disabled={savingProposal}>丢弃建议</button>
                 </div>
               </div>
             ) : null}
-            {conversation.context.kind === 'ephemeral-selection' ? (
-              <div className="conversation-actions ephemeral-actions">
-                <button type="button" onClick={() => void finalizeEphemeral(false)} disabled={conversationRunning || savingProposal}>保存引用</button>
-                <button type="button" onClick={() => void finalizeEphemeral(true)} disabled={conversationRunning || savingProposal || (!ephemeralSummary.trim() && !pendingProposal)}>保存摘要为笔记</button>
-                <button type="button" onClick={() => void discardEphemeralConversation()} disabled={conversationRunning || savingProposal}>丢弃</button>
+            {bookIndexConsent ? (
+              <div className="book-index-consent">
+                <h3>启用本书智能检索？</h3>
+                <p>Harness 需要先在本机建立这本书的索引，才能查找定义、定理和相关页面。内容不会上传。</p>
+                <small>预计占用约 {Math.round(bookIndexConsent.estimatedDiskBytes / 1024 / 1024)} MB 磁盘空间；构建时会使用 CPU。</small>
+                <div className="conversation-actions">
+                  <button className="primary" type="button" onClick={() => void respondToBookIndexConsent(true)} disabled={buildingBookIndex}>
+                    {buildingBookIndex ? '正在建立索引' : '允许并建立索引'}
+                  </button>
+                  <button type="button" onClick={() => void respondToBookIndexConsent(false)} disabled={buildingBookIndex}>暂不启用</button>
+                </div>
+              </div>
+            ) : null}
+            {conversation.context.kind === 'document' && bookIndexStatus === 'declined' && !bookIndexConsent ? (
+              <div className="book-index-declined">
+                <span>你之前暂不允许建立本书索引。</span>
+                <button type="button" onClick={() => void retryBookIndexConsent()}>重新允许索引</button>
+              </div>
+            ) : null}
+            {buildingBookIndex && bookIndexProgress ? (
+              <div className="book-index-progress" role="status" aria-live="polite">
+                <div className="book-index-progress-heading">
+                  <span>{bookIndexProgress.phase === 'saving' ? '正在保存索引' : '正在建立本书索引'}</span>
+                  <strong>{bookIndexProgress.current} / {bookIndexProgress.total} 页</strong>
+                </div>
+                <div className="book-index-progress-track" aria-hidden="true">
+                  <span style={{ width: `${Math.round((bookIndexProgress.current / Math.max(bookIndexProgress.total, 1)) * 100)}%` }} />
+                </div>
+                <small>{bookIndexProgress.phase === 'saving' ? '即将完成，可以继续阅读。' : '正在读取 PDF 文本，应用仍可继续使用。'}</small>
               </div>
             ) : null}
           </section>
@@ -2118,12 +2963,54 @@ export function App() {
           role="toolbar"
           aria-label="所选文本操作"
         >
-          <button type="button" onClick={() => { setDrawerMode('note'); setSelectionActionPosition(null); }}>添加笔记</button>
-          <button type="button" onClick={() => void askAiAboutDraft()}>Ask AI</button>
+          <button type="button" onClick={() => void saveDraftHighlight()}>添加高亮</button>
+          <button type="button" onClick={openDraftNoteEditor}>添加笔记</button>
+          <button type="button" onClick={() => void askAiAboutDraft()}>询问 AI</button>
           <button type="button" onClick={() => void copyDraftSelection()}>复制</button>
         </div>
       ) : null}
       {selectionActionError ? <p className="selection-action-error" role="status">{selectionActionError}</p> : null}
+      {anchorContextMenu ? (() => {
+        const anchor = anchors.find((item) => item.id === anchorContextMenu.anchorId);
+        if (!anchor) return null;
+        const hasNotes = notesForAnchor(anchor.id).length > 0;
+        return (
+          <div
+            className="anchor-context-menu"
+            role="menu"
+            aria-label="高亮操作"
+            style={{ left: anchorContextMenu.left, top: anchorContextMenu.top }}
+            onContextMenu={(event) => event.preventDefault()}
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            <button type="button" role="menuitem" onClick={() => openAnchorConversation(anchor)}>询问 AI</button>
+            <button type="button" role="menuitem" onClick={() => openAnchorNotes(anchor)}>{hasNotes ? '查看笔记' : '添加笔记'}</button>
+            <button type="button" role="menuitem" onClick={() => void copyAnchorQuote(anchor)}>复制高亮文本</button>
+            <div className="anchor-context-divider" role="separator" />
+            <button className="danger" type="button" role="menuitem" onClick={() => { setAnchorContextMenu(null); void deleteCurrentAnchor(anchor); }}>删除高亮</button>
+          </div>
+        );
+      })() : null}
+      {confirmationRequest ? (
+        <div className="confirm-backdrop" role="presentation" onMouseDown={() => resolveConfirmation(false)}>
+          <section
+            className="confirm-dialog"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="confirm-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <h2 id="confirm-title">{confirmationRequest.title}</h2>
+            <p>{confirmationRequest.message}</p>
+            <div className="confirm-actions">
+              <button type="button" onClick={() => resolveConfirmation(false)}>取消</button>
+              <button className="danger" type="button" onClick={() => resolveConfirmation(true)}>
+                {confirmationRequest.confirmLabel ?? '确认'}
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
       {settingsOpen ? (
         <div className="settings-backdrop" role="presentation" onMouseDown={closeSettings}>
           <section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" onMouseDown={(event) => event.stopPropagation()}>

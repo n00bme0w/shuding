@@ -22,9 +22,11 @@ import {
   deleteConversation,
   deleteNote,
   getAiSettings,
+  getBookIndexStatus,
   getAnchorById,
   getNotesByAnchorIds,
   listConversationsByDocument,
+  searchDocumentChunks,
   saveAiSettings,
   saveAnchor,
   saveConversation,
@@ -115,6 +117,7 @@ function toConversationMessages(messages: AgentMessage[]): ConversationMessage[]
 
 function documentFingerprint(context: ConversationContext) {
   if (context.kind === 'ephemeral-selection') return context.selection.documentFingerprint;
+  if (context.kind === 'document') return context.documentFingerprint;
   const anchor = getAnchorById(context.anchorId);
   if (!anchor) throw new Error('Anchor not found');
   if (context.selection && context.selection.documentFingerprint !== anchor.documentId) throw new Error('Selection does not belong to the anchor document');
@@ -123,6 +126,7 @@ function documentFingerprint(context: ConversationContext) {
 
 function contextForTool(context: ConversationContext) {
   if (context.kind === 'ephemeral-selection') return { ...context.selection, kind: 'text' };
+  if (context.kind === 'document') return { quote: 'Whole document conversation', pageIndex: 0, kind: 'document', documentFingerprint: context.documentFingerprint };
   if (context.selection) return { ...context.selection, kind: 'text' };
   const anchor = getAnchorById(context.anchorId);
   if (!anchor) throw new Error('Anchor no longer exists');
@@ -142,7 +146,24 @@ function mutateDocument<T>(documentId: string, operation: () => Promise<T>): Pro
 
 const anchorSchema = Type.Object({ anchor: Type.String({ minLength: 1, maxLength: 128 }) });
 const proposalSchema = Type.Object({ anchor: Type.String({ minLength: 1, maxLength: 128 }), summary: Type.String({ minLength: 1, maxLength: 2_000 }) });
+const bookSearchSchema = Type.Object({ anchor: Type.String({ minLength: 1, maxLength: 128 }), query: Type.String({ minLength: 1, maxLength: 1_000 }), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })) });
+const bookIndexSchema = Type.Object({ anchor: Type.String({ minLength: 1, maxLength: 128 }) });
+const navigatePageSchema = Type.Object({
+  anchor: Type.String({ minLength: 1, maxLength: 128 }),
+  page: Type.Integer({ minimum: 1, maximum: 100_000 }),
+  reason: Type.Optional(Type.String({ minLength: 1, maxLength: 300 })),
+  quote: Type.Optional(Type.String({ minLength: 1, maxLength: 1_000 }))
+});
+const autoAnchorSchema = Type.Object({
+  anchor: Type.String({ minLength: 1, maxLength: 128 }),
+  page: Type.Integer({ minimum: 1, maximum: 100_000 }),
+  quote: Type.String({ minLength: 8, maxLength: 1_000 })
+});
 type AnchorParams = Static<typeof anchorSchema>;
+type BookSearchParams = Static<typeof bookSearchSchema>;
+type BookIndexParams = Static<typeof bookIndexSchema>;
+type NavigatePageParams = Static<typeof navigatePageSchema>;
+type AutoAnchorParams = Static<typeof autoAnchorSchema>;
 
 function getLiveSession(conversationId: string, ownerWebContentsId?: number) {
   const session = sessions.get(conversationId);
@@ -153,7 +174,10 @@ function getLiveSession(conversationId: string, ownerWebContentsId?: number) {
 function touch(session: Session) { session.lastUsedAt = Date.now(); }
 
 function persistSession(session: Session) {
-  saveConversation({ id: session.id, documentFingerprint: session.documentFingerprint, context: session.context, source: session.source, messages: session.messages, lastUsedAt: session.lastUsedAt });
+  const context = session.context.kind === 'document'
+    ? { kind: 'document' as const, documentFingerprint: session.context.documentFingerprint }
+    : session.context;
+  saveConversation({ id: session.id, documentFingerprint: session.documentFingerprint, context, source: session.source, messages: session.messages, lastUsedAt: session.lastUsedAt });
 }
 
 function hydrateSession(stored: StoredConversation, owner: ConversationOwner): Session {
@@ -251,6 +275,11 @@ function hasMatchingSource(existing: Session, context: ConversationContext) {
   return existingSelection.documentFingerprint === nextSelection.documentFingerprint && existingSelection.pageIndex === nextSelection.pageIndex && existingSelection.quote === nextSelection.quote && existingSelection.normalizedQuote === nextSelection.normalizedQuote;
 }
 
+function findSavedAnchorSession(documentFingerprint: string, anchorId: string, webContentsId: number) {
+  return Array.from(sessionsByDocument.get(documentFingerprint) ?? [], (id) => sessions.get(id))
+    .find((session) => session && !session.removed && session.owner.webContentsId === webContentsId && session.context.kind === 'saved-anchor' && session.context.anchorId === anchorId) ?? null;
+}
+
 function assertValidEphemeralContext(context: Extract<ConversationContext, { kind: 'ephemeral-selection' }>) {
   const selection = context.selection;
   requireText(selection.documentFingerprint, 'document fingerprint', 256);
@@ -274,7 +303,80 @@ function createTools(session: Session): AgentTool[] {
     name: 'propose_note_summary', label: 'Propose note summary', description: 'Propose a concise note summary. It is never saved until the user explicitly confirms it in the app.', parameters: proposalSchema, executionMode: 'sequential',
     async execute(_toolCallId, params) { assertScope(params); if (!getLiveSession(session.id, session.owner.webContentsId)) throw new Error('Conversation was discarded'); const proposal: ProposalRecord = { id: randomUUID(), conversationId: session.id, anchorId: session.context.kind === 'saved-anchor' ? session.context.anchorId : undefined, body: params.summary.trim(), expiresAt: new Date(Date.now() + PROPOSAL_TTL_MS).toISOString(), ownerWebContentsId: session.owner.webContentsId }; proposals.set(session.id, proposal); emitIfLive(session, { type: 'proposal', conversationId: session.id, proposal: { id: proposal.id, conversationId: proposal.conversationId, anchorId: proposal.anchorId, body: proposal.body, expiresAt: proposal.expiresAt } }); const text = 'A note proposal is ready for user review. It has not been saved.'; return { content: [{ type: 'text' as const, text }], details: { text } }; }
   };
-  return [getAnchorContext, listAnchorNotes, proposeNoteSummary];
+  const searchBook: AgentTool<typeof bookSearchSchema, { text: string }> = {
+    name: 'search_book',
+    label: 'Search book',
+    description: 'Search the current PDF using a small local index. Use this when the user asks where a definition, theorem, or concept appears. Search results include page numbers and short source passages; do not pretend the entire book was provided.',
+    parameters: bookSearchSchema,
+    executionMode: 'sequential',
+    async execute(_toolCallId, params: BookSearchParams) {
+      assertScope(params);
+      if (getBookIndexStatus(session.documentFingerprint) !== 'ready') throw new Error('Book index is not ready; call ensure_book_index before searching.');
+      const rows = searchDocumentChunks(session.documentFingerprint, params.query, params.limit ?? 8);
+      const text = truncate(JSON.stringify({ results: rows.map((row) => ({ page: row.pageIndex + 1, quote: row.text, score: row.score })) }), MAX_TOOL_OUTPUT_LENGTH);
+      return { content: [{ type: 'text' as const, text }], details: { text } };
+    }
+  };
+  const ensureBookIndex: AgentTool<typeof bookIndexSchema, { text: string }> = {
+    name: 'ensure_book_index',
+    label: 'Prepare book search',
+    description: 'Check whether the current PDF has a local search index. If it is missing, this asks the user for permission before any book text is indexed. Call this before search_book.',
+    parameters: bookIndexSchema,
+    executionMode: 'sequential',
+    async execute(_toolCallId, params: BookIndexParams) {
+      assertScope(params);
+      const status = getBookIndexStatus(session.documentFingerprint);
+      if (status === 'ready') {
+        const text = JSON.stringify({ status: 'ready' });
+        return { content: [{ type: 'text' as const, text }], details: { text } };
+      }
+      if (status === 'building') {
+        const text = JSON.stringify({ status: 'building', message: 'The local index is still being prepared. Tell the user it will be ready shortly.' });
+        return { content: [{ type: 'text' as const, text }], details: { text } };
+      }
+      if (status === 'declined') {
+        const text = JSON.stringify({ status: 'declined', message: 'The user previously declined indexing this book. The app provides a retry authorization action.' });
+        return { content: [{ type: 'text' as const, text }], details: { text } };
+      }
+      emitIfLive(session, { type: 'index_consent', conversationId: session.id, documentFingerprint: session.documentFingerprint, estimatedDiskBytes: 80 * 1024 * 1024 });
+      const text = JSON.stringify({ status: 'consent_required', message: 'Ask the user to approve the local index card shown in the app before searching.' });
+      return { content: [{ type: 'text' as const, text }], details: { text } };
+    }
+  };
+  const navigateToPage: AgentTool<typeof navigatePageSchema, { text: string }> = {
+    name: 'navigate_to_page',
+    label: 'Navigate to page',
+    description: 'Ask the app to navigate the reader to a page in the current PDF. Page numbers are 1-based. Use this after search_book identifies the most relevant definition, theorem, or passage, and include a short reason and the exact supporting quote when available. This changes only the reader viewport; it does not create a highlight.',
+    parameters: navigatePageSchema,
+    executionMode: 'sequential',
+    async execute(_toolCallId, params: NavigatePageParams) {
+      assertScope(params);
+      emitIfLive(session, {
+        type: 'navigate_to_page',
+        conversationId: session.id,
+        documentFingerprint: session.documentFingerprint,
+        page: params.page,
+        reason: params.reason,
+        quote: params.quote ?? session.source.quote
+      });
+      const text = JSON.stringify({ status: 'navigation_requested', page: params.page });
+      return { content: [{ type: 'text' as const, text }], details: { text } };
+    }
+  };
+  const createAutoAnchor: AgentTool<typeof autoAnchorSchema, { text: string }> = {
+    name: 'create_auto_anchor',
+    label: 'Create source highlight',
+    description: 'Create a saved source highlight for a passage found with search_book. Call this only after search results identify a page and quote. The app resolves the quote to its exact PDF text geometry and saves the highlight; do not invent a quote.',
+    parameters: autoAnchorSchema,
+    executionMode: 'sequential',
+    async execute(_toolCallId, params: AutoAnchorParams) {
+      assertScope(params);
+      emitIfLive(session, { type: 'auto_anchor', conversationId: session.id, documentFingerprint: session.documentFingerprint, page: params.page, quote: params.quote.trim() });
+      const text = JSON.stringify({ status: 'anchor_requested', page: params.page, quote: params.quote.trim() });
+      return { content: [{ type: 'text' as const, text }], details: { text } };
+    }
+  };
+  return [getAnchorContext, listAnchorNotes, ensureBookIndex, searchBook, navigateToPage, createAutoAnchor, proposeNoteSummary];
 }
 
 function createAgent(session: Session) {
@@ -283,7 +385,11 @@ function createAgent(session: Session) {
   const model: Model<'openai-completions'> = { id: settings.modelId, name: settings.modelId, api: 'openai-completions', provider: PROVIDER_ID, baseUrl: settings.baseUrl, reasoning: false, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128_000, maxTokens: 8_192 };
   const models = createModels();
   models.setProvider(createProvider({ id: PROVIDER_ID, name: 'Shuding OpenAI-compatible', baseUrl: model.baseUrl, auth: { apiKey: { name: 'Shuding API key', resolve: async () => ({ auth: { apiKey: getApiKey() } }) } }, models: [model], api: { stream: streamOpenAiCompletions, streamSimple: streamOpenAiCompletions } }));
-  return new Agent({ initialState: { systemPrompt: `You are a reading companion for the current PDF selection. Use only the available context tools when needed. The current conversation ID is ${session.id}; provide it as the anchor argument to every context tool. Do not claim to browse the web or access files. A proposed note is never saved until the user confirms it in the app.`, model, messages: session.messages, tools: createTools(session), thinkingLevel: 'off' }, streamFn: models.streamSimple.bind(models), toolExecution: 'sequential', sessionId: session.id });
+  const isVoicePage = session.context.kind === 'ephemeral-selection' && session.context.selection.mode === 'voice-page';
+  const sourcePolicy = isVoicePage
+    ? 'This is a push-to-talk question about the page currently being read. The supplied quote is the complete current-page text and is your only source. Do not search the book or navigate elsewhere. Before answering, identify an exact supporting sentence or exercise fragment from that page and call create_auto_anchor with its current page and verbatim quote. If the page does not support the question, say so and do not create an anchor.'
+    : 'When locating a concept in the book, call ensure_book_index first. Only if it reports ready may you call search_book. If it reports consent_required, explain that the app is awaiting the user choice; never claim that you searched the book. When search results identify the relevant passage, choose an exact supporting quote, call navigate_to_page, then call create_auto_anchor with that same page and quote before answering.';
+  return new Agent({ initialState: { systemPrompt: `You are a reading companion for the current PDF selection. Use only the available context tools when needed. The current conversation ID is ${session.id}; provide it as the anchor argument to every context tool. Do not claim to browse the web or access files. ${sourcePolicy} Never invent a quote or page. A proposed note is never saved until the user confirms it in the app.`, model, messages: session.messages, tools: createTools(session), thinkingLevel: 'off' }, streamFn: models.streamSimple.bind(models), toolExecution: 'sequential', sessionId: session.id });
 }
 
 export function getSettings() { return safeSettings(); }
@@ -310,14 +416,20 @@ export async function openConversation(context: ConversationContext, owner: Conv
   const source = contextForTool(context);
   return await mutateDocument(fingerprint, async () => {
     loadSessionsForDocument(fingerprint, owner.webContentsId);
-    if (context.kind === 'saved-anchor') {
-      const existing = Array.from(sessionsByDocument.get(fingerprint) ?? [], (id) => sessions.get(id)).find((session) => session && !session.removed && session.owner.webContentsId === owner.webContentsId && hasMatchingSource(session, context));
+    if (context.kind === 'document' && !context.fresh) {
+      const existing = Array.from(sessionsByDocument.get(fingerprint) ?? [], (id) => sessions.get(id))
+        .find((session) => session && !session.removed && session.owner.webContentsId === owner.webContentsId && session.context.kind === 'document');
       if (existing) { touch(existing); persistSession(existing); return snapshot(existing); }
     }
-    if (context.kind === 'saved-anchor') await makeRoom(fingerprint);
+    if (context.kind === 'saved-anchor') {
+      const existing = findSavedAnchorSession(fingerprint, context.anchorId, owner.webContentsId) ??
+        Array.from(sessionsByDocument.get(fingerprint) ?? [], (id) => sessions.get(id)).find((session) => session && !session.removed && session.owner.webContentsId === owner.webContentsId && hasMatchingSource(session, context));
+      if (existing) { touch(existing); persistSession(existing); return snapshot(existing); }
+    }
+    if (context.kind !== 'ephemeral-selection') await makeRoom(fingerprint);
     const session: Session = { id: randomUUID(), context, documentFingerprint: fingerprint, source, owner, messages: [], lastUsedAt: Date.now(), status: 'idle', removed: false };
     sessions.set(session.id, session);
-    if (context.kind === 'saved-anchor') {
+    if (context.kind !== 'ephemeral-selection') {
       const documentSessions = sessionsByDocument.get(fingerprint) ?? new Set<string>();
       documentSessions.add(session.id); sessionsByDocument.set(fingerprint, documentSessions);
       persistSession(session);
@@ -391,6 +503,7 @@ export async function finalizeEphemeral(input: FinalizeEphemeralInput, webConten
   const documentSessions = sessionsByDocument.get(session.documentFingerprint) ?? new Set<string>();
   documentSessions.add(session.id); sessionsByDocument.set(session.documentFingerprint, documentSessions);
   const note = body || proposal ? saveNote(anchor.id, body ?? proposal!.body) : null;
+  if (proposal) proposals.delete(session.id);
   touch(session);
   try { persistSession(session); } catch (error: unknown) { deleteAnchor(anchor.id); throw error; }
   return { anchor, note };

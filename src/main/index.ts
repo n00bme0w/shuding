@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, type IpcMainInvokeEvent, type WebContents } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, session, type IpcMainInvokeEvent, type WebContents } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs/promises';
@@ -13,8 +13,14 @@ import {
   getRecentDocumentById,
   listRecentDocuments,
   saveAnchor,
+  saveBookIndexStatus,
+  getBookIndexStatus,
+  resetBookIndexStatus,
   saveNote,
   saveReadingState,
+  replaceDocumentChunks,
+  searchDocumentChunks,
+  recoverInterruptedBookIndexes,
   upsertRecentDocument
 } from '../db/store';
 import {
@@ -34,6 +40,7 @@ import {
   saveSettings,
   sendConversationMessage
 } from './ai/service';
+import { pushVoiceAudio, startVoiceStream, stopVoiceService, stopVoiceStream } from './asr/service';
 import type {
   AnchorDraft,
   ConfirmNoteProposalInput,
@@ -46,8 +53,12 @@ import type {
   SaveAiSettingsInput,
   SaveNoteInput,
   SaveReadingStateInput,
-  SendConversationInput
+  SendConversationInput,
+  BookSearchInput,
+  DocumentChunkInput,
+  BookIndexConsentInput
 } from '../shared';
+import { startEmbeddingService, stopEmbeddingService } from './embedding/service';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -163,6 +174,40 @@ ipcMain.handle('reader:state-save', async (_event, input: SaveReadingStateInput)
   return saveReadingState(input);
 });
 
+ipcMain.handle('book:index-chunks', async (event, chunks: DocumentChunkInput[]) => {
+  assertTrustedSender(event);
+  if (!Array.isArray(chunks) || chunks.length === 0) return;
+  const documentFingerprint = chunks[0]?.documentFingerprint;
+  if (!documentFingerprint || chunks.some((chunk) => chunk.documentFingerprint !== documentFingerprint)) {
+    throw new Error('Invalid document index payload');
+  }
+  replaceDocumentChunks(documentFingerprint, chunks);
+});
+
+ipcMain.handle('book:search', async (event, input: BookSearchInput) => {
+  assertTrustedSender(event);
+  return searchDocumentChunks(input.documentFingerprint, input.query, input.limit);
+});
+
+ipcMain.handle('book:index-consent', async (event, input: BookIndexConsentInput) => {
+  assertTrustedSender(event);
+  if (input.allowed) {
+    const available = await startEmbeddingService();
+    if (!available) throw new Error('本地语义检索服务无法启动');
+  }
+  saveBookIndexStatus(input.documentFingerprint, input.allowed ? 'building' : 'declined');
+});
+
+ipcMain.handle('book:index-status', async (event, documentFingerprint: string) => {
+  assertTrustedSender(event);
+  return getBookIndexStatus(documentFingerprint);
+});
+
+ipcMain.handle('book:index-reset', async (event, documentFingerprint: string) => {
+  assertTrustedSender(event);
+  resetBookIndexStatus(documentFingerprint);
+});
+
 ipcMain.handle('anchor:save', async (_event, draft: AnchorDraft) => {
   const anchor = createAnchor(draft);
   saveAnchor(anchor);
@@ -210,6 +255,23 @@ ipcMain.handle('conversation:send', async (event, input: SendConversationInput) 
   await sendConversationMessage(input.conversationId, input.content, eventOwner(sender));
 });
 
+ipcMain.handle('voice:start', async (event) => {
+  const sender = assertTrustedSender(event);
+  await startVoiceStream((voiceEvent) => {
+    if (!sender.isDestroyed()) sender.send('voice:event', voiceEvent);
+  });
+});
+
+ipcMain.handle('voice:chunk', async (event, audio: ArrayBuffer) => {
+  assertTrustedSender(event);
+  pushVoiceAudio(audio);
+});
+
+ipcMain.handle('voice:stop', async (event) => {
+  assertTrustedSender(event);
+  stopVoiceStream();
+});
+
 ipcMain.handle('conversation:abort', async (event, conversationId: string) => {
   const sender = assertTrustedSender(event);
   abortConversation(conversationId, sender.id);
@@ -255,6 +317,12 @@ ipcMain.handle('anchor:delete-cascade', async (event, input: DeleteAnchorInput) 
 });
 
 app.whenReady().then(() => {
+  // SpeechRecognition requests microphone access from Chromium's renderer. Only
+  // grant it to our own application window, never to an arbitrary web origin.
+  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
+    callback(permission === 'media' && BrowserWindow.fromWebContents(webContents) !== null);
+  });
+  recoverInterruptedBookIndexes();
   createWindow();
 
   app.on('activate', () => {
@@ -266,6 +334,11 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
-    app.quit();
+    void stopEmbeddingService().finally(() => app.quit());
   }
+});
+
+app.on('before-quit', () => {
+  stopVoiceService();
+  void stopEmbeddingService();
 });

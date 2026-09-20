@@ -185,6 +185,53 @@ const MIGRATIONS: ReadonlyArray<{ version: number; up: (database: Database.Datab
         `);
       })();
     }
+  },
+  {
+    version: 6,
+    up(database) {
+      database.exec(`
+        create table if not exists documentChunks (
+          id text primary key,
+          documentFingerprint text not null,
+          pageIndex integer not null,
+          chunkIndex integer not null,
+          text text not null,
+          createdAt text not null,
+          unique(documentFingerprint, pageIndex, chunkIndex)
+        );
+        create index if not exists documentChunks_document_idx
+          on documentChunks (documentFingerprint, pageIndex);
+        create virtual table if not exists documentChunksFts using fts5(
+          text,
+          content='documentChunks',
+          content_rowid='rowid'
+        );
+      `);
+      database.exec(`
+        insert into documentChunksFts(rowid, text)
+        select rowid, text from documentChunks
+        where rowid not in (select rowid from documentChunksFts);
+      `);
+    }
+  },
+  {
+    version: 7,
+    up(database) {
+      database.exec(`
+        create table if not exists bookIndexes (
+          documentFingerprint text primary key,
+          status text not null check (status in ('building', 'ready', 'declined')),
+          chunkCount integer not null default 0,
+          updatedAt text not null
+        );
+      `);
+    }
+  },
+  {
+    version: 8,
+    up(database) {
+      database.exec('alter table readingStates add column pageOffset real;');
+    }
   }
 ];
 
@@ -552,6 +599,7 @@ export type StoredReadingState = {
   scale: number;
   currentPage: number;
   scrollTop: number;
+  pageOffset: number | null;
   updatedAt: string;
 };
 
@@ -559,21 +607,135 @@ export function saveReadingState(state: SaveReadingStateInput): ReadingState {
   const database = getDb();
   const updatedAt = new Date().toISOString();
   database.prepare(
-    `insert into readingStates (documentFingerprint, scale, currentPage, scrollTop, updatedAt)
-     values (@documentFingerprint, @scale, @currentPage, @scrollTop, @updatedAt)
+    `insert into readingStates (documentFingerprint, scale, currentPage, scrollTop, pageOffset, updatedAt)
+     values (@documentFingerprint, @scale, @currentPage, @scrollTop, @pageOffset, @updatedAt)
      on conflict(documentFingerprint) do update set
        scale = excluded.scale,
        currentPage = excluded.currentPage,
        scrollTop = excluded.scrollTop,
+       pageOffset = excluded.pageOffset,
        updatedAt = excluded.updatedAt`
-  ).run({ ...state, updatedAt });
+  ).run({ ...state, pageOffset: state.pageOffset ?? null, updatedAt });
   return state;
 }
 
 export function getReadingState(documentFingerprint: string): ReadingState | null {
   const database = getDb();
   const row = database.prepare(
-    'select documentFingerprint, scale, currentPage, scrollTop from readingStates where documentFingerprint = @documentFingerprint'
-  ).get({ documentFingerprint }) as Pick<StoredReadingState, 'documentFingerprint' | 'scale' | 'currentPage' | 'scrollTop'> | undefined;
-  return row ?? null;
+    'select documentFingerprint, scale, currentPage, scrollTop, pageOffset from readingStates where documentFingerprint = @documentFingerprint'
+  ).get({ documentFingerprint }) as Pick<StoredReadingState, 'documentFingerprint' | 'scale' | 'currentPage' | 'scrollTop' | 'pageOffset'> | undefined;
+  return row ? {
+    documentFingerprint: row.documentFingerprint,
+    scale: row.scale,
+    currentPage: row.currentPage,
+    scrollTop: row.scrollTop,
+    ...(row.pageOffset === null ? {} : { pageOffset: row.pageOffset })
+  } : null;
+}
+
+export type DocumentChunk = {
+  id: string;
+  documentFingerprint: string;
+  pageIndex: number;
+  chunkIndex: number;
+  text: string;
+};
+
+export type BookIndexStatus = 'building' | 'ready' | 'declined' | 'missing';
+
+export function getBookIndexStatus(documentFingerprint: string): BookIndexStatus {
+  const database = getDb();
+  const row = database.prepare('select status from bookIndexes where documentFingerprint = @documentFingerprint').get({ documentFingerprint }) as { status: Exclude<BookIndexStatus, 'missing'> } | undefined;
+  return row?.status ?? 'missing';
+}
+
+export function saveBookIndexStatus(documentFingerprint: string, status: Exclude<BookIndexStatus, 'missing'>, chunkCount = 0) {
+  const database = getDb();
+  database.prepare(`
+    insert into bookIndexes (documentFingerprint, status, chunkCount, updatedAt)
+    values (@documentFingerprint, @status, @chunkCount, @updatedAt)
+    on conflict(documentFingerprint) do update set status = excluded.status, chunkCount = excluded.chunkCount, updatedAt = excluded.updatedAt
+  `).run({ documentFingerprint, status, chunkCount, updatedAt: new Date().toISOString() });
+}
+
+export function resetBookIndexStatus(documentFingerprint: string) {
+  const database = getDb();
+  database.prepare('delete from bookIndexes where documentFingerprint = @documentFingerprint').run({ documentFingerprint });
+}
+
+/**
+ * A renderer-side index build can be interrupted when Electron is closed.
+ * Never leave that book looking permanently "building" on the next launch.
+ * Remove any partial rows and let the normal consent flow start a clean build.
+ */
+export function recoverInterruptedBookIndexes() {
+  const database = getDb();
+  const interrupted = database.prepare(
+    `select documentFingerprint from bookIndexes where status = 'building'`
+  ).all() as Array<{ documentFingerprint: string }>;
+  if (interrupted.length === 0) return;
+
+  database.transaction(() => {
+    for (const { documentFingerprint } of interrupted) {
+      database.prepare(
+        `delete from documentChunksFts
+         where rowid in (select rowid from documentChunks where documentFingerprint = @documentFingerprint)`
+      ).run({ documentFingerprint });
+      database.prepare('delete from documentChunks where documentFingerprint = @documentFingerprint').run({ documentFingerprint });
+      database.prepare('delete from bookIndexes where documentFingerprint = @documentFingerprint').run({ documentFingerprint });
+    }
+  })();
+}
+
+export type BookSearchResult = DocumentChunk & { score: number };
+
+export function replaceDocumentChunks(documentFingerprint: string, chunks: Array<Omit<DocumentChunk, 'id'>>) {
+  const database = getDb();
+  const insert = database.prepare(`
+    insert into documentChunks (id, documentFingerprint, pageIndex, chunkIndex, text, createdAt)
+    values (@id, @documentFingerprint, @pageIndex, @chunkIndex, @text, @createdAt)
+  `);
+  const insertFts = database.prepare('insert into documentChunksFts(rowid, text) select rowid, text from documentChunks where id = @id');
+  database.transaction(() => {
+    database.prepare('delete from documentChunksFts where rowid in (select rowid from documentChunks where documentFingerprint = @documentFingerprint)').run({ documentFingerprint });
+    database.prepare('delete from documentChunks where documentFingerprint = @documentFingerprint').run({ documentFingerprint });
+    const createdAt = new Date().toISOString();
+    for (const chunk of chunks) {
+      const id = randomUUID();
+      insert.run({ id, ...chunk, createdAt });
+      insertFts.run({ id });
+    }
+    saveBookIndexStatus(documentFingerprint, 'ready', chunks.length);
+  })();
+}
+
+function searchTerms(query: string) {
+  return query.trim().split(/\s+/).map((term) => term.replace(/["()*:^{}[\]]/g, '')).filter(Boolean);
+}
+
+export function searchDocumentChunks(documentFingerprint: string, query: string, limit = 8): BookSearchResult[] {
+  const database = getDb();
+  const boundedLimit = Math.max(1, Math.min(Math.floor(limit), 20));
+  const terms = searchTerms(query);
+  if (terms.length === 0) return [];
+  const match = terms.map((term) => `"${term}"`).join(' OR ');
+  const ftsRows = database.prepare(`
+    select c.id, c.documentFingerprint, c.pageIndex, c.chunkIndex, c.text, bm25(documentChunksFts) as score
+    from documentChunksFts
+    join documentChunks c on c.rowid = documentChunksFts.rowid
+    where documentChunksFts match @match and c.documentFingerprint = @documentFingerprint
+    order by score asc
+    limit @limit
+  `).all({ match, documentFingerprint, limit: boundedLimit }) as BookSearchResult[];
+  if (ftsRows.length >= boundedLimit) return ftsRows;
+  const likeRows = database.prepare(`
+    select id, documentFingerprint, pageIndex, chunkIndex, text, 0 as score
+    from documentChunks
+    where documentFingerprint = @documentFingerprint
+      and (${terms.map((_, index) => `text like @term${index}`).join(' or ')})
+    order by pageIndex asc, chunkIndex asc
+    limit @limit
+  `).all({ documentFingerprint, limit: boundedLimit, ...Object.fromEntries(terms.map((term, index) => [`term${index}`, `%${term}%`])) }) as BookSearchResult[];
+  const seen = new Set(ftsRows.map((row) => row.id));
+  return [...ftsRows, ...likeRows.filter((row) => !seen.has(row.id))].slice(0, boundedLimit);
 }
