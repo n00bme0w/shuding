@@ -144,6 +144,7 @@ input:focus-visible {
   border-right: 0;
   border-left: 1px solid var(--line);
   box-shadow: -14px 0 34px rgba(27, 34, 42, 0.12);
+  animation: drawer-in 160ms ease-out both;
 }
 
 .drawer-scrim {
@@ -153,6 +154,17 @@ input:focus-visible {
   border: 0;
   background: rgba(27, 34, 42, 0.08);
   cursor: default;
+  animation: scrim-in 160ms ease-out both;
+}
+
+@keyframes drawer-in {
+  from { opacity: 0; transform: translateX(18px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes scrim-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 
 .drawer-resize-handle {
@@ -1816,6 +1828,12 @@ button:disabled {
   border-radius: 6px;
   background: var(--panel);
   box-shadow: 0 20px 60px rgba(27, 34, 42, 0.22);
+  animation: confirm-in 140ms ease-out both;
+}
+
+@keyframes confirm-in {
+  from { opacity: 0; transform: translateY(6px) scale(0.99); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
 }
 
 .confirm-dialog h2 {

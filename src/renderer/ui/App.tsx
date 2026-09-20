@@ -3011,12 +3011,13 @@ export function App() {
             role="alertdialog"
             aria-modal="true"
             aria-labelledby="confirm-title"
+            aria-describedby="confirm-message"
             onMouseDown={(event) => event.stopPropagation()}
           >
             <h2 id="confirm-title">{confirmationRequest.title}</h2>
-            <p>{confirmationRequest.message}</p>
+            <p id="confirm-message">{confirmationRequest.message}</p>
             <div className="confirm-actions">
-              <button type="button" onClick={() => resolveConfirmation(false)}>取消</button>
+              <button autoFocus type="button" onClick={() => resolveConfirmation(false)}>取消</button>
               <button className="danger" type="button" onClick={() => resolveConfirmation(true)}>
                 {confirmationRequest.confirmLabel ?? '确认'}
               </button>
