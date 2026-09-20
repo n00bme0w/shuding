@@ -648,6 +648,15 @@ export function App() {
     setScale(clamp(available / page.width, MIN_SCALE, MAX_SCALE));
   }
 
+  function fitWholePage() {
+    if (!pdf || !pageSurfaceRef.current) return;
+    const page = pageDimensions.get(Math.max(currentPage - 1, 0));
+    if (!page) return;
+    const availableWidth = Math.max(pageSurfaceRef.current.clientWidth - 80, 320);
+    const availableHeight = Math.max(pageSurfaceRef.current.clientHeight - 64, 320);
+    setScale(clamp(Math.min(availableWidth / page.width, availableHeight / page.height), MIN_SCALE, MAX_SCALE));
+  }
+
   useEffect(() => {
     if (!confirmationRequest) return;
     const onKeyDown = (event: KeyboardEvent) => {
@@ -2552,8 +2561,10 @@ export function App() {
               {sidebarCollapsed ? '›' : '‹'}
             </button>
             <div className="page-navigation" aria-label="页码导航">
+              <button type="button" aria-label="上一页" title="上一页" onClick={() => jumpToPage(String(currentPage - 1))} disabled={!pdf || currentPage <= 1}>‹</button>
               <input aria-label="当前页码" value={pageInput} onChange={(event) => setPageInput(event.target.value)} onBlur={() => jumpToPage(pageInput)} onKeyDown={(event) => { if (event.key === 'Enter') jumpToPage(pageInput); }} disabled={!pdf} inputMode="numeric" />
               <span>/ {pageCount || '—'}</span>
+              <button type="button" aria-label="下一页" title="下一页" onClick={() => jumpToPage(String(currentPage + 1))} disabled={!pdf || currentPage >= pageCount}>›</button>
             </div>
             <button
               type="button"
@@ -2611,6 +2622,7 @@ export function App() {
               <button type="button" className="zoom-reset" title="恢复 100%" onClick={() => setScale(DEFAULT_SCALE)} disabled={!pdf || scale === DEFAULT_SCALE}>{Math.round(scale * 100)}%</button>
               <button type="button" aria-label="放大" title="放大" onClick={() => setScale((value) => nextZoom(value, 1))} disabled={!pdf || scale >= MAX_SCALE}>+</button>
               <button type="button" className="zoom-fit" title="适应阅读区宽度" onClick={fitPageWidth} disabled={!pdf}>适应宽度</button>
+              <button type="button" className="zoom-fit" title="适应整页" onClick={fitWholePage} disabled={!pdf}>适应整页</button>
             </div>
           </div>
         </header>

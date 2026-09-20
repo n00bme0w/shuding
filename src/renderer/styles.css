@@ -364,6 +364,26 @@ button:disabled {
   text-align: center;
 }
 
+.page-navigation button {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 18px;
+  line-height: 1;
+}
+
+.page-navigation button:hover:not(:disabled) {
+  border-color: var(--line);
+  background: #f7f9fb;
+  color: var(--ink);
+}
+
 .topbar-actions,
 .drawer-controls {
   display: flex;
