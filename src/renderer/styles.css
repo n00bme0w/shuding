@@ -220,9 +220,10 @@ input:focus-visible {
 
 .sidebar-actions {
   display: flex;
-  flex: 1;
+  flex: 1 1 0%;
   flex-direction: column;
   min-height: 0;
+  overflow: hidden;
   gap: 10px;
   margin-top: 24px;
 }
@@ -260,10 +261,11 @@ button:disabled {
 
 .recent-documents {
   display: flex;
-  flex: 1;
+  flex: 1 1 0%;
   flex-direction: column;
   gap: 8px;
   min-height: 0;
+  height: 0;
   overflow: visible;
   padding: 2px;
 }
@@ -276,8 +278,9 @@ button:disabled {
 }
 
 .recent-documents-list {
-  flex: 1;
+  flex: 1 1 0%;
   min-height: 0;
+  height: 0;
   overflow-y: auto;
   padding-right: 2px;
 }
