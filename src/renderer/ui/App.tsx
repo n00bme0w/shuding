@@ -603,9 +603,11 @@ export function App() {
   const pushToTalkHeldRef = useRef(false);
   const sendConversationMessageRef = useRef<(content?: string) => Promise<void>>(async () => {});
   const confirmationResolverRef = useRef<((confirmed: boolean) => void) | null>(null);
+  const confirmationReturnFocusRef = useRef<HTMLElement | null>(null);
 
   function requestConfirmation(request: ConfirmationRequest) {
     return new Promise<boolean>((resolve) => {
+      confirmationReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
       confirmationResolverRef.current = resolve;
       setConfirmationRequest(request);
     });
@@ -615,6 +617,8 @@ export function App() {
     confirmationResolverRef.current?.(confirmed);
     confirmationResolverRef.current = null;
     setConfirmationRequest(null);
+    window.setTimeout(() => confirmationReturnFocusRef.current?.focus(), 0);
+    confirmationReturnFocusRef.current = null;
   }
 
   useEffect(() => {
@@ -3071,6 +3075,10 @@ export function App() {
               <div className="settings-intro">
                 <strong>连接 AI 服务</strong>
                 <p>用于整本书问答、引用解释和笔记建议。配置只保存在本机。</p>
+              </div>
+              <div className="settings-shortcuts">
+                <span>快捷键</span>
+                <small>按住 Y，可对当前页进行语音提问；在输入框中不会触发。</small>
               </div>
               <label>
                 <span>服务地址</span>

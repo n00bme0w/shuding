@@ -1973,6 +1973,27 @@ button:disabled {
   line-height: 1.45;
 }
 
+.settings-shortcuts {
+  display: grid;
+  gap: 3px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #f7f9fb;
+}
+
+.settings-shortcuts span {
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.settings-shortcuts small {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 .ai-settings-panel label {
   display: grid;
   gap: 5px;
