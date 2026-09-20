@@ -2576,9 +2576,9 @@ export function App() {
               </button>
             </div>
             <div className="zoom-controls" aria-label="缩放控制">
-              <button type="button" aria-label="缩小" onClick={() => setScale((value) => nextZoom(value, -1))} disabled={!pdf || scale <= MIN_SCALE}>-</button>
-              <button type="button" className="zoom-reset" onClick={() => setScale(DEFAULT_SCALE)} disabled={!pdf || scale === DEFAULT_SCALE}>{Math.round(scale * 100)}%</button>
-              <button type="button" aria-label="放大" onClick={() => setScale((value) => nextZoom(value, 1))} disabled={!pdf || scale >= MAX_SCALE}>+</button>
+              <button type="button" aria-label="缩小" title="缩小" onClick={() => setScale((value) => nextZoom(value, -1))} disabled={!pdf || scale <= MIN_SCALE}>-</button>
+              <button type="button" className="zoom-reset" title="恢复 100%" onClick={() => setScale(DEFAULT_SCALE)} disabled={!pdf || scale === DEFAULT_SCALE}>{Math.round(scale * 100)}%</button>
+              <button type="button" aria-label="放大" title="放大" onClick={() => setScale((value) => nextZoom(value, 1))} disabled={!pdf || scale >= MAX_SCALE}>+</button>
             </div>
           </div>
         </header>
