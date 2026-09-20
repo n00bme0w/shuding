@@ -518,6 +518,7 @@ export function App() {
   const [pageDimensions, setPageDimensions] = useState<Map<number, PageDimensions>>(() => new Map());
   const [visiblePageIndices, setVisiblePageIndices] = useState<Set<number>>(() => new Set());
   const [currentPage, setCurrentPage] = useState(1);
+  const [pageInput, setPageInput] = useState('1');
   const [scale, setScale] = useState(DEFAULT_SCALE);
   const [anchors, setAnchors] = useState<Anchor[]>([]);
   const [notesByAnchorId, setNotesByAnchorId] = useState<Record<string, Note[]>>({});
@@ -619,6 +620,29 @@ export function App() {
   useEffect(() => {
     openedDocumentRef.current = openedDocument;
   }, [openedDocument]);
+
+  useEffect(() => {
+    setPageInput(String(currentPage));
+  }, [currentPage]);
+
+  function jumpToPage(value: string) {
+    const page = Number.parseInt(value, 10);
+    if (!Number.isFinite(page) || page < 1 || page > pageCount) {
+      setPageInput(String(currentPage));
+      return;
+    }
+    const frame = pageSurfaceRef.current?.querySelector<HTMLElement>(`[data-page-index="${page - 1}"]`);
+    if (frame) pageSurfaceRef.current?.scrollTo({ top: frame.offsetTop - 24, behavior: 'smooth' });
+    setCurrentPage(page);
+  }
+
+  function fitPageWidth() {
+    if (!pdf || !pageSurfaceRef.current) return;
+    const page = pageDimensions.get(Math.max(currentPage - 1, 0));
+    if (!page) return;
+    const available = Math.max(pageSurfaceRef.current.clientWidth - 80, 320);
+    setScale(clamp(available / page.width, MIN_SCALE, MAX_SCALE));
+  }
 
   useEffect(() => {
     if (!confirmationRequest) return;
@@ -2523,7 +2547,10 @@ export function App() {
             >
               {sidebarCollapsed ? '›' : '‹'}
             </button>
-            <div className="doc-meta">{pageCount > 0 ? `第 ${currentPage} / ${pageCount} 页` : '等待导入 PDF'}</div>
+            <div className="page-navigation" aria-label="页码导航">
+              <input aria-label="当前页码" value={pageInput} onChange={(event) => setPageInput(event.target.value)} onBlur={() => jumpToPage(pageInput)} onKeyDown={(event) => { if (event.key === 'Enter') jumpToPage(pageInput); }} disabled={!pdf} inputMode="numeric" />
+              <span>/ {pageCount || '—'}</span>
+            </div>
             <button
               type="button"
               className="reading-back-button"
@@ -2562,7 +2589,7 @@ export function App() {
                 onClick={toggleDocumentConversation}
                 title="打开整本书 AI 对话"
               >
-                AI
+                整本书
               </button>
               <button
                 ref={settingsTriggerRef}
@@ -2579,6 +2606,7 @@ export function App() {
               <button type="button" aria-label="缩小" title="缩小" onClick={() => setScale((value) => nextZoom(value, -1))} disabled={!pdf || scale <= MIN_SCALE}>-</button>
               <button type="button" className="zoom-reset" title="恢复 100%" onClick={() => setScale(DEFAULT_SCALE)} disabled={!pdf || scale === DEFAULT_SCALE}>{Math.round(scale * 100)}%</button>
               <button type="button" aria-label="放大" title="放大" onClick={() => setScale((value) => nextZoom(value, 1))} disabled={!pdf || scale >= MAX_SCALE}>+</button>
+              <button type="button" className="zoom-fit" title="适应阅读区宽度" onClick={fitPageWidth} disabled={!pdf}>适应宽度</button>
             </div>
           </div>
         </header>
