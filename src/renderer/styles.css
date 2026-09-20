@@ -2091,11 +2091,20 @@ button:disabled {
 @media (max-width: 880px) {
 
   .shell {
-    grid-template-columns: var(--sidebar-width, 176px) minmax(0, 1fr);
+    grid-template-columns: var(--sidebar-width, 208px) minmax(0, 1fr);
   }
 
   .shell.drawer-open {
-    grid-template-columns: var(--sidebar-width, 176px) minmax(0, 1fr);
+    grid-template-columns: var(--sidebar-width, 208px) minmax(0, 1fr);
+  }
+
+  .sidebar-copy,
+  .sidebar-status {
+    display: none;
+  }
+
+  .sidebar-actions {
+    margin-top: 16px;
   }
 
   .drawer {
