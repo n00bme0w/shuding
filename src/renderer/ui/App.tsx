@@ -575,6 +575,8 @@ export function App() {
   const pageSurfaceRef = useRef<HTMLElement>(null);
   const openedDocumentRef = useRef<OpenedDocument | null>(null);
   const settingsTriggerRef = useRef<HTMLButtonElement>(null);
+  const settingsModalRef = useRef<HTMLElement>(null);
+  const confirmationDialogRef = useRef<HTMLElement>(null);
   const assistantDraftRef = useRef('');
   const selectionPreviewFrameRef = useRef<number | null>(null);
   const conversationIdRef = useRef<string | null>(null);
@@ -619,6 +621,21 @@ export function App() {
     setConfirmationRequest(null);
     window.setTimeout(() => confirmationReturnFocusRef.current?.focus(), 0);
     confirmationReturnFocusRef.current = null;
+  }
+
+  function trapFocus(event: React.KeyboardEvent<HTMLElement>) {
+    if (event.key !== 'Tab') return;
+    const focusable = Array.from(event.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])'));
+    if (focusable.length === 0) return;
+    const first = focusable[0];
+    const last = focusable.at(-1)!;
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
   }
 
   useEffect(() => {
@@ -3058,12 +3075,14 @@ export function App() {
       {confirmationRequest ? (
         <div className="confirm-backdrop" role="presentation" onMouseDown={() => resolveConfirmation(false)}>
           <section
+            ref={confirmationDialogRef}
             className="confirm-dialog"
             role="alertdialog"
             aria-modal="true"
             aria-labelledby="confirm-title"
             aria-describedby="confirm-message"
             onMouseDown={(event) => event.stopPropagation()}
+            onKeyDown={trapFocus}
           >
             <h2 id="confirm-title">{confirmationRequest.title}</h2>
             <p id="confirm-message">{confirmationRequest.message}</p>
@@ -3078,7 +3097,7 @@ export function App() {
       ) : null}
       {settingsOpen ? (
         <div className="settings-backdrop" role="presentation" onMouseDown={closeSettings}>
-          <section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" onMouseDown={(event) => event.stopPropagation()}>
+          <section ref={settingsModalRef} className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" onMouseDown={(event) => event.stopPropagation()} onKeyDown={trapFocus}>
             <div className="modal-header">
               <h2 id="settings-title">AI 设置</h2>
               <button type="button" className="drawer-close" onClick={closeSettings} aria-label="关闭 AI 设置">关闭</button>
