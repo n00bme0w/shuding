@@ -2519,8 +2519,9 @@ export function App() {
               onClick={() => setSidebarCollapsed((collapsed) => !collapsed)}
               aria-label={sidebarCollapsed ? '展开侧栏' : '收起侧栏'}
               aria-expanded={!sidebarCollapsed}
+              title={sidebarCollapsed ? '展开侧栏' : '收起侧栏'}
             >
-              {sidebarCollapsed ? '☰' : '☰'}
+              {sidebarCollapsed ? '›' : '‹'}
             </button>
             <div className="doc-meta">{pageCount > 0 ? `第 ${currentPage} / ${pageCount} 页` : '等待导入 PDF'}</div>
             <button
@@ -2541,6 +2542,7 @@ export function App() {
                 aria-expanded={drawerMode === 'annotations'}
                 aria-controls="contextual-drawer"
                 onClick={() => toggleDrawer('annotations')}
+                title="查看文档高亮和标注"
               >
                 标注
               </button>
@@ -2549,6 +2551,7 @@ export function App() {
                 aria-expanded={drawerMode === 'note'}
                 aria-controls="contextual-drawer"
                 onClick={() => toggleDrawer('note')}
+                title="查看或添加笔记"
               >
                 笔记
               </button>
@@ -2557,6 +2560,7 @@ export function App() {
                 aria-expanded={drawerMode === 'ai'}
                 aria-controls="contextual-drawer"
                 onClick={toggleDocumentConversation}
+                title="打开整本书 AI 对话"
               >
                 AI
               </button>
@@ -2566,6 +2570,7 @@ export function App() {
                 aria-haspopup="dialog"
                 aria-expanded={settingsOpen}
                 onClick={() => setSettingsOpen(true)}
+                title="配置 AI 服务"
               >
                 设置
               </button>
@@ -2957,7 +2962,7 @@ export function App() {
           </section>
           ) : (
             <section className="drawer-section ai-empty-state">
-              <p>先选中一段文字并使用“Ask AI”，或从标注中选择已保存引用。</p>
+              <p>先选中一段文字并使用“询问 AI”，或从标注中选择已保存引用。</p>
               {!aiSettings?.hasApiKey ? <p className="note-status error">保存安全 API Key 后即可开始对话。</p> : null}
               {conversationError ? <p className="note-status error">{conversationError}</p> : null}
             </section>
