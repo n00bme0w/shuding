@@ -76,6 +76,8 @@ input:focus-visible {
 }
 
 .sidebar {
+  display: flex;
+  flex-direction: column;
   overflow: auto;
 }
 
@@ -216,7 +218,10 @@ input:focus-visible {
 }
 
 .sidebar-actions {
-  display: grid;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
   gap: 10px;
   margin-top: 24px;
 }
@@ -253,7 +258,9 @@ button:disabled {
 }
 
 .recent-documents {
-  display: grid;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
   gap: 8px;
   min-height: 0;
   overflow: visible;
@@ -265,6 +272,13 @@ button:disabled {
 .annotation-group {
   display: grid;
   gap: 8px;
+}
+
+.recent-documents-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 2px;
 }
 
 .sidebar .recent-document {
