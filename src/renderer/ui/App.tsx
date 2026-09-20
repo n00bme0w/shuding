@@ -2651,11 +2651,11 @@ export function App() {
           </div>
         ) : null}
 
-        <section className="page-surface" ref={pageSurfaceRef}>
+        <section className="page-surface" ref={pageSurfaceRef} aria-busy={loadingDocument || undefined}>
           {!pdf ? (
             <div className="page-placeholder" role="status">
-              <strong>还没有打开文档</strong>
-              <span>从左侧导入 PDF，开始阅读和整理标注。</span>
+              <strong>{loadingDocument ? '正在打开文档' : '还没有打开文档'}</strong>
+              <span>{loadingDocument ? '正在读取 PDF 页面和已保存的阅读位置。' : '从左侧导入 PDF，开始阅读和整理标注。'}</span>
             </div>
           ) : (
             <div className="page-flow">

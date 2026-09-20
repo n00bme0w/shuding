@@ -440,6 +440,20 @@ button:disabled {
   font-size: 13px;
 }
 
+.page-surface[aria-busy="true"] .page-placeholder::before {
+  content: '';
+  width: 22px;
+  height: 22px;
+  border: 2px solid #c7d4e0;
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: reading-spinner 750ms linear infinite;
+}
+
+@keyframes reading-spinner {
+  to { transform: rotate(360deg); }
+}
+
 .page-frame {
   position: relative;
   width: 612px;
