@@ -1953,11 +1953,36 @@ button:disabled {
   gap: 12px;
 }
 
+.settings-intro {
+  display: grid;
+  gap: 4px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--line);
+}
+
+.settings-intro strong {
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.settings-intro p,
+.ai-settings-panel label small {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 .ai-settings-panel label {
   display: grid;
   gap: 5px;
   color: rgba(29, 23, 19, 0.72);
   font-size: 12px;
+}
+
+.ai-settings-panel label > span {
+  color: var(--ink);
+  font-weight: 600;
 }
 
 .ai-settings-panel input {

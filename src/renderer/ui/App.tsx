@@ -3068,16 +3068,23 @@ export function App() {
               <button type="button" className="drawer-close" onClick={closeSettings} aria-label="关闭 AI 设置">关闭</button>
             </div>
             <div className="ai-settings-panel">
+              <div className="settings-intro">
+                <strong>连接 AI 服务</strong>
+                <p>用于整本书问答、引用解释和笔记建议。配置只保存在本机。</p>
+              </div>
               <label>
-                Base URL
+                <span>服务地址</span>
+                <small>兼容 OpenAI 接口的服务地址</small>
                 <input value={aiBaseUrl} onChange={(event) => setAiBaseUrl(event.target.value)} placeholder="https://api.example.com/v1" />
               </label>
               <label>
-                模型 ID
+                <span>模型 ID</span>
+                <small>例如 gpt-4o-mini</small>
                 <input value={aiModelId} onChange={(event) => setAiModelId(event.target.value)} placeholder="gpt-4o-mini" />
               </label>
               <label>
-                API Key
+                <span>API Key</span>
+                <small>{aiSettings?.hasApiKey ? '已有安全保存的密钥，留空则保持不变' : '仅保存在系统安全存储中'}</small>
                 <input type="password" value={aiApiKey} onChange={(event) => setAiApiKey(event.target.value)} placeholder={aiSettings?.hasApiKey ? '已安全保存；留空保持不变' : '仅保存在安全存储中'} />
               </label>
               <button className="primary full" type="button" onClick={() => void saveAiConfiguration()} disabled={savingAiSettings || !aiBaseUrl.trim() || !aiModelId.trim()}>
