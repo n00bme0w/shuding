@@ -2892,7 +2892,8 @@ export function App() {
                 onClick={toggleSpeechRecognition}
                 disabled={conversationRunning || !aiSettings?.hasApiKey || speechRecognitionState === 'transcribing'}
                 aria-label={speechRecognitionState === 'idle' ? '开始语音输入' : '停止语音输入'}
-                title={speechRecognitionState === 'idle' ? '开始语音输入' : '停止语音输入'}
+                aria-keyshortcuts="Y"
+                title={speechRecognitionState === 'idle' ? '开始语音输入（按住 Y 可对当前页提问）' : '停止语音输入'}
               >
                 <span aria-hidden="true">{speechRecognitionState === 'listening' ? '■' : '🎙'}</span>
               </button>
