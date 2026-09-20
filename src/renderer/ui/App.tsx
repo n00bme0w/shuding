@@ -2464,7 +2464,7 @@ export function App() {
         <>
         <div>
           <div className="brand">书钉</div>
-          <p className="sidebar-copy">阅读、选句、存档，一次完成。</p>
+          <p className="sidebar-copy">本地阅读与研究工作区</p>
         </div>
 
         <div className="sidebar-actions">
@@ -2592,8 +2592,9 @@ export function App() {
 
         <section className="page-surface" ref={pageSurfaceRef}>
           {!pdf ? (
-            <div className="page-placeholder">
-              PDF 页面将在这里渲染
+            <div className="page-placeholder" role="status">
+              <strong>还没有打开文档</strong>
+              <span>从左侧导入 PDF，开始阅读和整理标注。</span>
             </div>
           ) : (
             <div className="page-flow">

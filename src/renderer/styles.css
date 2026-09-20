@@ -380,12 +380,25 @@ button:disabled {
 
 .page-placeholder {
   display: grid;
+  align-content: center;
+  gap: 8px;
   min-height: calc(100vh - 160px);
   place-items: center;
-  border: 1px dashed rgba(31, 26, 23, 0.16);
+  border: 1px solid var(--line);
   border-radius: 8px;
-  color: rgba(31, 26, 23, 0.55);
-  background: rgba(255, 255, 255, 0.4);
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.56);
+  text-align: center;
+}
+
+.page-placeholder strong {
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 650;
+}
+
+.page-placeholder span {
+  font-size: 13px;
 }
 
 .page-frame {
