@@ -371,6 +371,11 @@ button:disabled {
   font-variant-numeric: tabular-nums;
 }
 
+.document-empty-state {
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .page-navigation input {
   width: 42px;
   padding: 4px 5px;

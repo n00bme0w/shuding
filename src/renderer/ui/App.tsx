@@ -2577,12 +2577,14 @@ export function App() {
             >
               {sidebarCollapsed ? '›' : '‹'}
             </button>
-            <div className="page-navigation" aria-label="页码导航">
-              <button type="button" aria-label="上一页" title="上一页" onClick={() => jumpToPage(String(currentPage - 1))} disabled={!pdf || currentPage <= 1}>‹</button>
-              <input aria-label="当前页码" value={pageInput} onChange={(event) => setPageInput(event.target.value)} onBlur={() => jumpToPage(pageInput)} onKeyDown={(event) => { if (event.key === 'Enter') jumpToPage(pageInput); }} disabled={!pdf} inputMode="numeric" />
-              <span>/ {pageCount || '—'}</span>
-              <button type="button" aria-label="下一页" title="下一页" onClick={() => jumpToPage(String(currentPage + 1))} disabled={!pdf || currentPage >= pageCount}>›</button>
-            </div>
+            {pdf ? (
+              <div className="page-navigation" aria-label="页码导航">
+                <button type="button" aria-label="上一页" title="上一页" onClick={() => jumpToPage(String(currentPage - 1))} disabled={currentPage <= 1}>‹</button>
+                <input aria-label="当前页码" value={pageInput} onChange={(event) => setPageInput(event.target.value)} onBlur={() => jumpToPage(pageInput)} onKeyDown={(event) => { if (event.key === 'Enter') jumpToPage(pageInput); }} inputMode="numeric" />
+                <span>/ {pageCount}</span>
+                <button type="button" aria-label="下一页" title="下一页" onClick={() => jumpToPage(String(currentPage + 1))} disabled={currentPage >= pageCount}>›</button>
+              </div>
+            ) : <span className="document-empty-state">未打开文档</span>}
             <button
               type="button"
               className="reading-back-button"
