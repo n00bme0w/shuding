@@ -2027,7 +2027,7 @@ button:disabled {
   }
 
   .drawer {
-    width: min(var(--drawer-width, 360px), calc(100vw - var(--sidebar-width, 176px)));
+    width: min(560px, calc(100vw - 16px));
   }
 
   .drawer-controls button {
@@ -2041,5 +2041,19 @@ button:disabled {
 
   .page-surface {
     padding: 16px;
+  }
+}
+
+@media (max-width: 560px) {
+  .drawer {
+    width: 100vw;
+  }
+
+  .topbar-actions .zoom-controls .zoom-fit {
+    display: none;
+  }
+
+  .page-surface {
+    padding-inline: 10px;
   }
 }
