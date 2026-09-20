@@ -255,9 +255,8 @@ button:disabled {
 .recent-documents {
   display: grid;
   gap: 8px;
-  max-height: 272px;
   min-height: 0;
-  overflow: auto;
+  overflow: visible;
   padding: 2px;
 }
 
