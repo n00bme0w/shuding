@@ -805,6 +805,15 @@ export function App() {
   }, [drawerMode, aiView, conversationId]);
 
   useEffect(() => {
+    if (drawerMode !== 'ai' || aiView !== 'chat') return;
+    // Reopening the AI panel should always start at the newest message, even
+    // when the user left this conversation scrolled up last time.
+    followConversationRef.current = true;
+    const list = conversationMessagesRef.current;
+    if (list) list.scrollTop = list.scrollHeight;
+  }, [aiView, conversationId, drawerMode]);
+
+  useEffect(() => {
     const list = conversationMessagesRef.current;
     if (list && followConversationRef.current) list.scrollTop = list.scrollHeight;
   }, [assistantDraft, conversation?.messages, aiView, drawerMode]);

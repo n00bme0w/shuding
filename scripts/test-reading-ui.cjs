@@ -108,6 +108,7 @@ function installMockBridge(pdfPath) {
     pushVoiceAudio: async () => {},
     stopVoiceStream: async () => voices.forEach((listener) => listener({ type: 'final', text: '' })),
     __setResumeDelay: (id, delay) => resumeDelays.set(id, delay),
+    __setConversationMessages: (id, messages) => { const session = sessions.get(id); if (session) session.messages = messages; },
     __getState: () => ({ ...state, sessionCount: sessions.size })
   };
   contextBridge.exposeInMainWorld('shuding', api);
@@ -221,6 +222,15 @@ app.whenReady().then(async () => {
     assert.equal(state.sessionCount, 1);
     assert.equal(state.highlights.length, 1);
     assert.equal(state.notes.length, 1, 'deleting history preserves saved annotations');
+    await evaluate(`window.shuding.__setConversationMessages('chat-2', Array.from({ length: 30 }, (_, index) => ({ id: 'long-' + index, role: index % 2 ? 'assistant' : 'user', content: ('第 ' + index + ' 轮对话内容。').repeat(8), createdAt: new Date().toISOString() })))`);
+    await clickText('问 AI');
+    await clickText('问 AI');
+    await waitFor(`document.querySelector('.conversation-messages') !== null`);
+    await waitFor(`(() => { const list = document.querySelector('.conversation-messages'); return list && list.scrollHeight - list.scrollTop - list.clientHeight < 5; })()`);
+    await evaluate(`document.querySelector('.conversation-messages').scrollTop = 0`);
+    await clickText('问 AI');
+    await clickText('问 AI');
+    await waitFor(`(() => { const list = document.querySelector('.conversation-messages'); return list && list.scrollHeight - list.scrollTop - list.clientHeight < 5; })()`);
     assert.equal(errors.length, 0, errors.join('\n'));
     console.log('Reading UI passed: continuous chat, notes, voice, exact selected sentence, empty topics, history restore races, per-chat drafts, and deletion fallback.');
   } catch (error) {
