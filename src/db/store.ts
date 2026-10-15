@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import path from 'node:path';
 import { app } from 'electron';
 import { randomUUID } from 'node:crypto';
-import type { Anchor, AnchorDraft, ConversationContext, Note, ReadingState, RecentDocument, Rect, SaveReadingStateInput } from '../shared';
+import type { Anchor, AnchorDraft, ConversationAnchor, ConversationContext, ConversationReadingContext, Note, ReadingState, RecentDocument, Rect, SaveReadingStateInput } from '../shared';
 
 let db: Database.Database | null = null;
 
@@ -232,6 +232,13 @@ const MIGRATIONS: ReadonlyArray<{ version: number; up: (database: Database.Datab
     up(database) {
       database.exec('alter table readingStates add column pageOffset real;');
     }
+  },
+  {
+    version: 9,
+    up(database) {
+      // Per-line highlight bands; normalizedRect remains the union bounding box.
+      database.exec('alter table anchors add column normalizedRects text;');
+    }
   }
 ];
 
@@ -340,9 +347,10 @@ function getRecentDocumentByFingerprint(fingerprint: string): StoredRecentDocume
   return row;
 }
 
-type StoredAnchor = Omit<Anchor, 'pageRect' | 'normalizedRect'> & {
+type StoredAnchor = Omit<Anchor, 'pageRect' | 'normalizedRect' | 'normalizedRects'> & {
   pageRect: string;
   normalizedRect: string;
+  normalizedRects: string | null;
 };
 
 function isRect(value: unknown): value is Rect {
@@ -367,11 +375,25 @@ function parseRect(value: string, field: string): Rect {
   return parsed;
 }
 
+function parseRects(value: string | null, field: string): Rect[] | undefined {
+  if (value === null || value === '') {
+    return undefined;
+  }
+  const parsed: unknown = JSON.parse(value);
+  if (!Array.isArray(parsed) || !parsed.every(isRect)) {
+    throw new Error(`Invalid ${field} stored in anchors`);
+  }
+  return parsed;
+}
+
 function hydrateAnchor(row: StoredAnchor): Anchor {
+  const { normalizedRects, ...rest } = row;
+  const rects = parseRects(normalizedRects, 'normalizedRects');
   return {
-    ...row,
+    ...rest,
     pageRect: parseRect(row.pageRect, 'pageRect'),
-    normalizedRect: parseRect(row.normalizedRect, 'normalizedRect')
+    normalizedRect: parseRect(row.normalizedRect, 'normalizedRect'),
+    ...(rects ? { normalizedRects: rects } : {})
   };
 }
 
@@ -380,15 +402,16 @@ export function saveAnchor(anchor: Anchor) {
   database.prepare(
     `insert into anchors (
       id, documentId, pageIndex, kind, quote, normalizedQuote,
-      pageRect, normalizedRect, confidence, createdAt, updatedAt
+      pageRect, normalizedRect, normalizedRects, confidence, createdAt, updatedAt
     ) values (
       @id, @documentId, @pageIndex, @kind, @quote, @normalizedQuote,
-      @pageRect, @normalizedRect, @confidence, @createdAt, @updatedAt
+      @pageRect, @normalizedRect, @normalizedRects, @confidence, @createdAt, @updatedAt
     )`
   ).run({
     ...anchor,
     pageRect: JSON.stringify(anchor.pageRect),
     normalizedRect: JSON.stringify(anchor.normalizedRect),
+    normalizedRects: anchor.normalizedRects ? JSON.stringify(anchor.normalizedRects) : null,
     confidence: anchor.confidence ?? null
   });
 }
@@ -407,7 +430,7 @@ export function getAnchorsByDocumentId(documentId: string): Anchor[] {
   const database = getDb();
   const rows = database
     .prepare(
-      `select id, documentId, pageIndex, kind, quote, normalizedQuote, pageRect, normalizedRect, confidence, createdAt, updatedAt
+      `select id, documentId, pageIndex, kind, quote, normalizedQuote, pageRect, normalizedRect, normalizedRects, confidence, createdAt, updatedAt
        from anchors
        where documentId = @documentId
        order by pageIndex asc, createdAt asc`
@@ -421,7 +444,7 @@ export function getAnchorById(anchorId: string): Anchor | null {
   const database = getDb();
   const row = database
     .prepare(
-      `select id, documentId, pageIndex, kind, quote, normalizedQuote, pageRect, normalizedRect, confidence, createdAt, updatedAt
+      `select id, documentId, pageIndex, kind, quote, normalizedQuote, pageRect, normalizedRect, normalizedRects, confidence, createdAt, updatedAt
        from anchors
        where id = @anchorId`
     )
@@ -523,7 +546,7 @@ export type ConversationPersist = {
   id: string;
   documentFingerprint: string;
   context: ConversationContext;
-  source: { quote: string; pageIndex: number; kind: string; documentFingerprint: string };
+  source: { quote: string; pageIndex: number; kind: string; documentFingerprint: string; contextAnchors?: ConversationAnchor[]; readingContext?: ConversationReadingContext; activeContextAnchorId?: string };
   messages: unknown[];
   lastUsedAt: number;
 };
@@ -576,17 +599,15 @@ export function getConversation(id: string): StoredConversation | null {
   ).get({ id }) as StoredConversation | undefined ?? null;
 }
 
-export function listConversationsByDocument(documentFingerprint: string, limit: number): StoredConversation[] {
+export function listConversationsByDocument(documentFingerprint: string): StoredConversation[] {
   const database = getDb();
-  const boundedLimit = Math.max(0, Math.min(Math.floor(limit), 50));
   return database.prepare(
     `select id, documentFingerprint, contextKind, anchorId, contextJson, sourceJson,
             quote, pageIndex, messagesJson, lastUsedAt, createdAt, updatedAt
      from conversations
      where documentFingerprint = @documentFingerprint
-     order by lastUsedAt desc
-     limit @limit`
-  ).all({ documentFingerprint, limit: boundedLimit }) as StoredConversation[];
+     order by lastUsedAt desc, id asc`
+  ).all({ documentFingerprint }) as StoredConversation[];
 }
 
 export function deleteConversation(id: string) {

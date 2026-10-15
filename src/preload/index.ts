@@ -16,7 +16,9 @@ import type {
   OpenedDocument,
   RecentDocument,
   ReadingState,
+  ResumeConversationInput,
   SaveAiSettingsInput,
+  SaveConversationNoteInput,
   SaveNoteInput,
   SaveReadingStateInput,
   SendConversationInput,
@@ -78,10 +80,14 @@ contextBridge.exposeInMainWorld('shuding', {
     ipcRenderer.invoke('ai:settings-save', input) as Promise<AiSettings>,
   openConversation: (context: OpenConversationInput) =>
     ipcRenderer.invoke('conversation:open', context) as Promise<ConversationSnapshot>,
+  resumeConversation: (input: ResumeConversationInput) =>
+    ipcRenderer.invoke('conversation:resume', input) as Promise<ConversationSnapshot>,
   listConversationSessions: (input: ListConversationSessionsInput) =>
     ipcRenderer.invoke('conversation:list-by-document', input) as Promise<ConversationSessionSummary[]>,
   sendConversationMessage: (input: SendConversationInput) =>
     ipcRenderer.invoke('conversation:send', input) as Promise<void>,
+  saveConversationNote: (input: SaveConversationNoteInput) =>
+    ipcRenderer.invoke('conversation:save-note', input) as Promise<FinalizeEphemeralResult>,
   startVoiceStream: () => ipcRenderer.invoke('voice:start') as Promise<void>,
   pushVoiceAudio: (audio: ArrayBuffer) => ipcRenderer.invoke('voice:chunk', audio) as Promise<void>,
   stopVoiceStream: () => ipcRenderer.invoke('voice:stop') as Promise<void>,
@@ -131,8 +137,10 @@ export type ShudingApi = {
   getAiSettings(): Promise<AiSettings>;
   saveAiSettings(input: SaveAiSettingsInput): Promise<AiSettings>;
   openConversation(context: OpenConversationInput): Promise<ConversationSnapshot>;
+  resumeConversation(input: ResumeConversationInput): Promise<ConversationSnapshot>;
   listConversationSessions(input: ListConversationSessionsInput): Promise<ConversationSessionSummary[]>;
   sendConversationMessage(input: SendConversationInput): Promise<void>;
+  saveConversationNote(input: SaveConversationNoteInput): Promise<FinalizeEphemeralResult>;
   startVoiceStream(): Promise<void>;
   pushVoiceAudio(audio: ArrayBuffer): Promise<void>;
   stopVoiceStream(): Promise<void>;

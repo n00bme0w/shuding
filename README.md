@@ -23,11 +23,13 @@ Shuding turns "select → ask → summarize → archive" into one workflow: sele
   - Agent runtime built on `@earendil-works/pi-agent-core` + `@earendil-works/pi-ai`
   - Any OpenAI-compatible endpoint (OpenAI, DeepSeek, SiliconFlow, etc.)
   - Multi-turn conversation, streaming replies, abort support
+  - Open Ask AI and ask directly: selected text or the current page is supplied automatically; page changes, new selections, and hold-Y voice questions continue the same discussion
+  - One-click explanations, Enter to send, Shift+Enter for a new line, and saving answers as notes at their source; New topic preserves the previous discussion
   - AI replies render Markdown — code blocks, lists, and quotes display cleanly in the panel
-  - Per-book LRU queue of up to 10 sessions; when exceeded, the least recently used session is evicted and permanently deleted
-  - Session history is persisted to local SQLite and survives app restarts; both memory and disk strictly keep at most 10 sessions per book
-  - Each conversation message is persisted as it happens, but permanent anchors/notes are written only when you explicitly choose to save
-  - Permanent anchors/notes are created only when you explicitly choose "Save reference" or "Save summary as note"
+  - History is ordered by the last question; viewing an old discussion does not reorder it, and empty new topics reuse a draft
+  - History is persisted in local SQLite without automatic deletion limits; idle memory caches are evicted independently, and failures, stops, and window closure retain received messages
+  - AI can capture source passages as context anchors with page numbers and provenance, reuse them in follow-up replies, and restore them with the conversation; inspect them and jump to the source in the chat panel
+  - Context anchors are independent of PDF highlights; permanent annotations are created only when you explicitly add a highlight, save a reference, or save a note
 - **Local-first & privacy**
   - All data (anchors, notes, recent documents, AI settings) lives in local SQLite
   - API keys are used only in the Electron main process, encrypted with the system keyring; the renderer never sees them
@@ -48,7 +50,7 @@ Shuding turns "select → ask → summarize → archive" into one workflow: sele
 | Recent documents | Up to 8 entries; reopen by internal ID |
 | Top bar · Annotations | Opens the full annotation/note index drawer |
 | Top bar · Note | Note drawer for the current selection / anchor |
-| Top bar · AI | AI conversation drawer for the current context (with recent session queue) |
+| Top bar · AI | AI conversation drawer for the current context (with per-book history) |
 | Top bar · Settings | AI configuration (Base URL / model / API key) |
 | Selection action bar | Add note · Ask AI · Copy |
 
@@ -70,6 +72,11 @@ Keyboard:
 ```bash
 npm install        # postinstall rebuilds better-sqlite3 for the Electron ABI
 npm run dev        # start Electron + renderer dev server
+
+# Optional: register a global command and desktop launcher for this checkout
+npm run install:launcher
+# Then run it from any directory:
+shuding
 npm run typecheck  # TypeScript check
 npm run build      # production build
 npm run rebuild:native  # recompile native modules for the Electron ABI
@@ -89,18 +96,17 @@ cd ../pi/packages/agent && npm run build
    - Base URL (e.g. `https://api.deepseek.com/v1`)
    - Model ID (e.g. `deepseek-chat`)
    - API key (saved to system secure storage only)
-3. Select a passage → click "Ask AI" in the selection action bar
-4. After the discussion:
-   - `Save reference`: create only the permanent highlighted quote
-   - `Save summary as note`: create the quote and write the summary as a note
-   - `Discard`: remove the temporary session and selection with no trace
+3. Open Ask AI and ask directly, select a passage for a one-click explanation, or hold Y to speak
+4. Continue asking or select another passage; the app supplies the current reading context. Use New topic to start a separate discussion
+5. Save a useful answer or an edited AI summary as a note; the app locates and attaches it to the supporting source passage
 
 ## Data & storage
 
 - Database location: `shuding.sqlite3` in the Electron `userData` directory
 - Stored: anchors, notes, recent documents, AI settings (including the encrypted API key)
-- AI conversations: session history is persisted in the `conversations` table, grouped per book; strictly at most 10 sessions are kept per book, and an LRU-evicted session is deleted from both memory and disk
-- After a restart or app exit, the most recent 10 conversations are not lost; what persists long-term are the anchors and notes you explicitly saved
+- AI conversations: history is persisted in the `conversations` table, grouped per book, without automatic retention limits. Clearing idle caches never deletes history; a new topic enters history after its first question
+- After a restart, exact conversation IDs restore messages and context anchors. Deleting a discussion preserves saved annotations, and deleting a highlight preserves its AI history and source context. Input drafts are kept per discussion while switching history
+- See [AI conversation and context anchors](docs/ai-context-flow.md) for the implementation workflow (Chinese)
 
 ## Tech stack
 
@@ -117,5 +123,5 @@ cd ../pi/packages/agent && npm run build
 ## Current status
 
 - 0.1.0 prototype stage
-- Done: PDF rendering, continuous scroll, zoom, selection/anchor/notes, recent documents, Pi-powered multi-turn AI chat, LRU session queue, session history persistence, drawer-first UI, secure credential storage
+- Done: PDF rendering, continuous scroll, zoom, selection/anchor/notes, recent documents, Pi-powered multi-turn AI chat, per-book conversation history, session history persistence, drawer-first UI, secure credential storage
 - Not yet: local OCR for scanned PDFs, formula OCR, book-wide `search_document`, web research tool, packaging/distribution

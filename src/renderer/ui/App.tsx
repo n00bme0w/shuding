@@ -3,12 +3,17 @@ import { getDocument, GlobalWorkerOptions, TextLayer, type PDFDocumentProxy, typ
 import { marked } from 'marked';
 import markedKatex from 'marked-katex-extension';
 import 'katex/dist/katex.min.css';
+import { resolveQuoteHighlight } from './quoteGeometry';
+import { extractSelectionContext, selectionReadingContext } from './readingContext';
 import { normalizeQuote } from '../../shared';
 import type {
   AiSettings,
   Anchor,
+  AnchorDraft,
+  ConversationAnchor,
   ConversationEvent,
   ConversationMessage,
+  ConversationReadingContext,
   ConversationSessionSummary,
   ConversationSnapshot,
   Note,
@@ -51,11 +56,13 @@ type PdfSelection = {
   pageIndex: number;
   pageRect: PageRect;
   normalizedRect: NormalizedRect;
-  normalizedClientRects: NormalizedRect[];
+  normalizedRects: NormalizedRect[];
 };
 
 type DraftSelection = PdfSelection & {
   documentId: string;
+  surroundingText?: string;
+  selectedSentence?: string;
 };
 
 type DrawerMode = 'annotations' | 'note' | 'ai' | null;
@@ -327,6 +334,7 @@ function PdfPage({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const textLayerRef = useRef<HTMLDivElement>(null);
   const pageDimensions = dimensions ?? FALLBACK_PAGE_DIMENSIONS;
+  const shouldRender = renderPriority !== undefined;
 
   useEffect(() => {
     const frame = frameRef.current;
@@ -336,8 +344,9 @@ function PdfPage({
     }
 
     const observer = new IntersectionObserver(
-      ([entry]) => {
-        onViewportChange(pageIndex, entry.isIntersecting);
+      (entries) => {
+        const latestEntry = entries.at(-1);
+        if (latestEntry) onViewportChange(pageIndex, latestEntry.isIntersecting);
       },
       { root: scrollRoot, threshold: [0, 0.5] }
     );
@@ -350,7 +359,7 @@ function PdfPage({
   }, [onViewportChange, pageIndex, scrollRootRef]);
 
   useEffect(() => {
-    if (renderPriority === undefined) {
+    if (!shouldRender) {
       return;
     }
 
@@ -436,7 +445,8 @@ function PdfPage({
       canvas.style.height = '';
       textLayer.replaceChildren();
     };
-  }, [outputScale, pageIndex, pdf, renderPriority, scale]);
+  // Priority only schedules the first render; reordering nearby pages must not clear their canvases.
+  }, [outputScale, pageIndex, pdf, shouldRender, scale]);
 
   return (
     <div
@@ -448,7 +458,7 @@ function PdfPage({
         minHeight: `${pageDimensions.height * scale}px`
       }}
     >
-      {renderPriority !== undefined ? (
+      {shouldRender ? (
         <>
           <canvas className="page-canvas" ref={canvasRef} />
           <div className="text-layer" ref={textLayerRef} />
@@ -467,19 +477,22 @@ function PdfPage({
             }}
           />
         ))}
-        {anchors.map((anchor) => (
-          <div
-            className={`anchor-highlight${anchor.id === activeAnchorId ? ' active' : ''}`}
-            key={anchor.id}
-            data-anchor-id={anchor.id}
-            style={{
-              left: `${anchor.normalizedRect.x * 100}%`,
-              top: `${anchor.normalizedRect.y * 100}%`,
-              width: `${anchor.normalizedRect.width * 100}%`,
-              height: `${anchor.normalizedRect.height * 100}%`
-            }}
-          />
-        ))}
+        {anchors.flatMap((anchor) => {
+          const rects = anchor.normalizedRects?.length ? anchor.normalizedRects : [anchor.normalizedRect];
+          return rects.map((rect, index) => (
+            <div
+              className={`anchor-highlight${anchor.id === activeAnchorId ? ' active' : ''}`}
+              key={`${anchor.id}-${index}`}
+              data-anchor-id={anchor.id}
+              style={{
+                left: `${rect.x * 100}%`,
+                top: `${rect.y * 100}%`,
+                width: `${rect.width * 100}%`,
+                height: `${rect.height * 100}%`
+              }}
+            />
+          ));
+        })}
         {anchors.flatMap((anchor) => {
           const notes = notesByAnchorId[anchor.id] ?? [];
           if (notes.length === 0 || (anchor.id !== activeAnchorId && anchor.id !== hoveredAnchorId)) {
@@ -543,7 +556,6 @@ export function App() {
   const [aiSettingsError, setAiSettingsError] = useState<string | null>(null);
   const [conversation, setConversation] = useState<ConversationSnapshot | null>(null);
   const [conversationId, setConversationId] = useState<string | null>(null);
-  const [activeConversationContext, setActiveConversationContext] = useState<ConversationSnapshot['context'] | null>(null);
   const [conversationSessions, setConversationSessions] = useState<ConversationSessionSummary[]>([]);
   const [conversationDraft, setConversationDraft] = useState('');
   const [conversationRunning, setConversationRunning] = useState(false);
@@ -554,13 +566,13 @@ export function App() {
   const [conversationError, setConversationError] = useState<string | null>(null);
   const [pendingProposal, setPendingProposal] = useState<PendingNoteProposal | null>(null);
   const [savingProposal, setSavingProposal] = useState(false);
+  const [conversationNoteStatus, setConversationNoteStatus] = useState<string | null>(null);
   const [ephemeralSummary, setEphemeralSummary] = useState('');
   const [drawerMode, setDrawerMode] = useState<DrawerMode>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [drawerWidth, setDrawerWidth] = useState(DRAWER_DEFAULT);
   const [isResizingDrawer, setIsResizingDrawer] = useState(false);
   const [aiView, setAiView] = useState<AiView>('chat');
-  const [quoteExpanded, setQuoteExpanded] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [selectionActionPosition, setSelectionActionPosition] = useState<SelectionActionPosition | null>(null);
   const [selectionActionError, setSelectionActionError] = useState<string | null>(null);
@@ -577,12 +589,22 @@ export function App() {
   const settingsTriggerRef = useRef<HTMLButtonElement>(null);
   const settingsModalRef = useRef<HTMLElement>(null);
   const confirmationDialogRef = useRef<HTMLElement>(null);
-  const assistantDraftRef = useRef('');
+  const conversationInputRef = useRef<HTMLTextAreaElement>(null);
+  const conversationMessagesRef = useRef<HTMLDivElement>(null);
+  const followConversationRef = useRef(true);
+  const speechReadingContextRef = useRef<ConversationReadingContext | undefined>(undefined);
   const selectionPreviewFrameRef = useRef<number | null>(null);
   const conversationIdRef = useRef<string | null>(null);
   const conversationRunningRef = useRef(false);
   const conversationRef = useRef<ConversationSnapshot | null>(null);
-  const conversationSnapshotsRef = useRef(new Map<string, ConversationSnapshot>());
+  const conversationRequestRef = useRef(0);
+  const conversationTurnRef = useRef(0);
+  const localConversationSendsRef = useRef(new Set<string>());
+  const historyRequestRef = useRef(0);
+  const preparingConversationRef = useRef<{ documentFingerprint: string; request: number; promise: Promise<ConversationSnapshot> } | null>(null);
+  const conversationDraftsRef = useRef(new Map<string, string>());
+  const conversationDraftRef = useRef('');
+  conversationDraftRef.current = conversationDraft;
   const draftSelectionRef = useRef<DraftSelection | null>(null);
   const anchorClickDownRef = useRef<{ x: number; y: number } | null>(null);
   const anchorClickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -603,7 +625,7 @@ export function App() {
   const speechAutoSendRef = useRef(false);
   const speechStateRef = useRef<'idle' | 'listening' | 'transcribing'>('idle');
   const pushToTalkHeldRef = useRef(false);
-  const sendConversationMessageRef = useRef<(content?: string) => Promise<void>>(async () => {});
+  const sendConversationMessageRef = useRef<(content?: string, readingContext?: ConversationReadingContext) => Promise<void>>(async () => {});
   const confirmationResolverRef = useRef<((confirmed: boolean) => void) | null>(null);
   const confirmationReturnFocusRef = useRef<HTMLElement | null>(null);
 
@@ -687,10 +709,6 @@ export function App() {
   }, [confirmationRequest]);
 
   useEffect(() => {
-    assistantDraftRef.current = assistantDraft;
-  }, [assistantDraft]);
-
-  useEffect(() => {
     speechStateRef.current = speechRecognitionState;
   }, [speechRecognitionState]);
 
@@ -700,14 +718,7 @@ export function App() {
 
   useEffect(() => {
     conversationRef.current = conversation;
-    if (conversation) {
-      conversationSnapshotsRef.current.set(conversation.conversationId, conversation);
-    }
   }, [conversation]);
-
-  useEffect(() => {
-    setQuoteExpanded(false);
-  }, [activeConversationContext, conversation?.conversationId]);
 
   useEffect(() => {
     conversationRunningRef.current = conversationRunning;
@@ -732,7 +743,9 @@ export function App() {
       const sendAfterTranscription = speechAutoSendRef.current;
       speechAutoSendRef.current = false;
       setSpeechRecognitionState('idle');
-      if (sendAfterTranscription && event.text.trim()) void sendConversationMessageRef.current(event.text);
+      const transcript = join(speechBaseDraftRef.current, speechCommittedRef.current).trim();
+      if (sendAfterTranscription && transcript) void sendConversationMessageRef.current(transcript, speechReadingContextRef.current);
+      speechReadingContextRef.current = undefined;
     }
   }), []);
 
@@ -741,12 +754,13 @@ export function App() {
   }, [draftSelection]);
 
   const clearEphemeralConversationLocal = useCallback(() => {
+    conversationRequestRef.current += 1;
+    if (conversationIdRef.current) conversationDraftsRef.current.set(conversationIdRef.current, conversationDraftRef.current);
     conversationIdRef.current = null;
     conversationRef.current = null;
     conversationRunningRef.current = false;
     setConversationId(null);
     setConversation(null);
-    setActiveConversationContext(null);
     setPendingProposal(null);
     setAssistantDraft('');
     setEphemeralSummary('');
@@ -755,32 +769,56 @@ export function App() {
     setSelectionActionError(null);
     setConversationRunning(false);
     setConversationDraft('');
+    conversationDraftRef.current = '';
     setSavingProposal(false);
+    setConversationNoteStatus(null);
   }, []);
 
-  const activateConversation = useCallback((snapshot: ConversationSnapshot, status: 'running' | 'idle' = 'idle') => {
+  const activateConversation = useCallback((snapshot: ConversationSnapshot) => {
+    const switching = conversationIdRef.current !== snapshot.conversationId;
+    if (switching) {
+      if (conversationIdRef.current) conversationDraftsRef.current.set(conversationIdRef.current, conversationDraftRef.current);
+      const draft = conversationDraftsRef.current.get(snapshot.conversationId) ?? '';
+      conversationDraftRef.current = draft;
+      setConversationDraft(draft);
+    }
     conversationIdRef.current = snapshot.conversationId;
     conversationRef.current = snapshot;
-    conversationSnapshotsRef.current.set(snapshot.conversationId, snapshot);
+    const running = snapshot.status === 'running' || localConversationSendsRef.current.has(snapshot.conversationId);
+    conversationRunningRef.current = running;
     setConversation(snapshot);
     setConversationId(snapshot.conversationId);
-    setActiveConversationContext(snapshot.context);
-    setConversationRunning(status === 'running');
+    setConversationRunning(running);
     setPendingProposal(snapshot.pendingProposal);
-    setAssistantDraft('');
+    setAssistantDraft(snapshot.streamingText ?? '');
     setToolStatus(null);
-    setConversationError(null);
     setEphemeralSummary('');
+    if (switching) {
+      setConversationError(null);
+      followConversationRef.current = true;
+      setConversationNoteStatus(null);
+    }
   }, []);
 
+  useEffect(() => {
+    if (drawerMode === 'ai' && aiView === 'chat') conversationInputRef.current?.focus();
+  }, [drawerMode, aiView, conversationId]);
+
+  useEffect(() => {
+    const list = conversationMessagesRef.current;
+    if (list && followConversationRef.current) list.scrollTop = list.scrollHeight;
+  }, [assistantDraft, conversation?.messages, aiView, drawerMode]);
+
   const refreshConversationSessions = useCallback(async (documentFingerprint = openedDocumentRef.current?.fingerprint) => {
+    const request = ++historyRequestRef.current;
     if (!bridgeAvailable || !documentFingerprint) {
       setConversationSessions([]);
       return;
     }
 
     try {
-      setConversationSessions(await window.shuding.listConversationSessions({ documentFingerprint }));
+      const history = await window.shuding.listConversationSessions({ documentFingerprint });
+      if (request === historyRequestRef.current && openedDocumentRef.current?.fingerprint === documentFingerprint) setConversationSessions(history);
     } catch (error) {
       console.error('Unable to load conversation sessions.', error);
     }
@@ -842,22 +880,38 @@ export function App() {
       return;
     }
     return window.shuding.subscribeConversationEvents((event: ConversationEvent) => {
-      void refreshConversationSessions();
+      if (event.type === 'status') void refreshConversationSessions();
       if (event.conversationId !== conversationIdRef.current) {
         return;
       }
       if (event.type === 'status') {
-        setConversationRunning(event.status === 'running');
+        setConversationRunning(event.status === 'running' || localConversationSendsRef.current.has(event.conversationId));
         if (event.status === 'idle') {
           setToolStatus(null);
-          void refreshConversationSessions();
+          if (localConversationSendsRef.current.has(event.conversationId)) return;
+          const documentFingerprint = openedDocumentRef.current?.fingerprint;
+          const request = conversationRequestRef.current;
+          const turn = conversationTurnRef.current;
+          if (documentFingerprint) void window.shuding.resumeConversation({ conversationId: event.conversationId, documentFingerprint }).then((snapshot) => {
+            if (turn === conversationTurnRef.current && request === conversationRequestRef.current && conversationIdRef.current === event.conversationId && openedDocumentRef.current?.fingerprint === documentFingerprint) activateConversation(snapshot);
+          }).catch(() => {});
         }
       } else if (event.type === 'assistant_delta') {
         setAssistantDraft((current) => current + event.delta);
       } else if (event.type === 'tool') {
-        setToolStatus(`${event.toolName}: ${event.status === 'running' ? '运行中' : event.status === 'completed' ? '完成' : '失败'}`);
+        const descriptions: Record<string, string> = { get_anchor_context: '正在阅读原文…', list_anchor_notes: '正在查看笔记…', ensure_book_index: '正在检查书内检索…', search_book: '正在查找相关内容…', create_auto_anchor: '正在整理参考原文…', propose_note_summary: '正在整理笔记…', navigate_to_page: '正在打开原文…' };
+        setToolStatus(event.status === 'running' ? descriptions[event.toolName] ?? '正在处理…' : null);
       } else if (event.type === 'proposal') {
         setPendingProposal(event.proposal);
+      } else if (event.type === 'context_anchor') {
+        if (event.anchor.documentFingerprint !== openedDocumentRef.current?.fingerprint) return;
+        setConversation((current) => current && current.conversationId === event.conversationId ? {
+          ...current,
+          activeContextAnchorId: event.anchor.id,
+          contextAnchors: current.contextAnchors.some((anchor) => anchor.id === event.anchor.id)
+            ? current.contextAnchors
+            : [...current.contextAnchors, event.anchor]
+        } : current);
       } else if (event.type === 'index_consent') {
         setBookIndexConsent(event);
       } else if (event.type === 'navigate_to_page') {
@@ -891,52 +945,29 @@ export function App() {
             window.setTimeout(() => focusTarget(0), 350);
           }
         }
-      } else if (event.type === 'auto_anchor') {
-        if (event.documentFingerprint === openedDocumentRef.current?.fingerprint) {
-          void saveAutoAnchor(event.page, event.quote);
-        }
       } else if (event.type === 'error') {
         setConversationError(event.message);
       }
     });
-  }, [bridgeAvailable, pageCount, refreshConversationSessions]);
+  }, [activateConversation, bridgeAvailable, pageCount, refreshConversationSessions]);
 
-  async function saveAutoAnchor(page: number, quote: string) {
-    const documentId = openedDocumentRef.current?.fingerprint;
-    if (!documentId || !quote.trim()) return;
-    const locate = async (attempt: number): Promise<void> => {
-      const pageFrame = pageSurfaceRef.current?.querySelector<HTMLElement>(`[data-page-index="${page - 1}"]`);
-      const target = pageFrame ? findTextLayerTarget(pageFrame, quote) : null;
-      if (!pageFrame || !target) {
-        if (attempt < 8) window.setTimeout(() => { void locate(attempt + 1); }, 250);
-        return;
-      }
-      const bounds = pageFrame.getBoundingClientRect();
-      const rect = target.getBoundingClientRect();
-      if (bounds.width <= 0 || bounds.height <= 0 || rect.width <= 0 || rect.height <= 0) return;
-      const normalizedRect = {
-        x: clamp((rect.left - bounds.left) / bounds.width, 0, 1),
-        y: clamp((rect.top - bounds.top) / bounds.height, 0, 1),
-        width: clamp(rect.width / bounds.width, 0.002, 1),
-        height: clamp(rect.height / bounds.height, 0.002, 1)
-      };
-      try {
-        const anchor = await window.shuding.saveAnchor({
-          documentId,
-          pageIndex: page - 1,
-          kind: 'text',
-          quote: quote.trim(),
-          normalizedQuote: normalizeQuote(quote),
-          pageRect: { x: rect.left - bounds.left, y: rect.top - bounds.top, width: rect.width, height: rect.height },
-          normalizedRect,
-          confidence: 1
-        });
-        setAnchors((current) => current.some((item) => item.documentId === anchor.documentId && item.pageIndex === anchor.pageIndex && item.normalizedQuote === anchor.normalizedQuote) ? current : [...current, anchor]);
-      } catch (error: unknown) {
-        setConversationError(`自动创建高亮失败：${error instanceof Error ? error.message : '未知错误'}`);
-      }
+  function navigateToContextAnchor(anchor: ConversationAnchor) {
+    if (anchor.documentFingerprint !== openedDocumentRef.current?.fingerprint) return;
+    const pageSurface = pageSurfaceRef.current;
+    const pageFrame = pageSurface?.querySelector<HTMLElement>(`[data-page-index="${anchor.pageIndex}"]`);
+    if (!pageSurface || !pageFrame) return;
+    navigationHistoryRef.current = [...navigationHistoryRef.current, { documentFingerprint: anchor.documentFingerprint, page: currentPage, scrollTop: pageSurface.scrollTop }].slice(-20);
+    pageSurface.scrollTo({ top: Math.max(pageFrame.offsetTop - 28, 0), behavior: 'smooth' });
+    setCurrentPage(anchor.pageIndex + 1);
+    setNavigationNotice({ page: anchor.pageIndex + 1, reason: '查看对话锚点原文' });
+    window.setTimeout(() => setNavigationNotice(null), 3_000);
+    const focusTarget = (attempt: number) => {
+      if (openedDocumentRef.current?.fingerprint !== anchor.documentFingerprint) return;
+      const target = findTextLayerTarget(pageFrame, anchor.quote);
+      if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
+      else if (attempt < 3) window.setTimeout(() => focusTarget(attempt + 1), 350);
     };
-    await locate(0);
+    window.setTimeout(() => focusTarget(0), 350);
   }
 
   function restorePreviousReadingPosition() {
@@ -1101,27 +1132,6 @@ export function App() {
     document.addEventListener('pointerdown', closeMenu);
     return () => document.removeEventListener('pointerdown', closeMenu);
   }, [anchorContextMenu]);
-
-  useEffect(() => {
-    if (!activeAnchor || !bridgeAvailable) {
-      return;
-    }
-    let cancelled = false;
-    void window.shuding.openConversation({ kind: 'saved-anchor', anchorId: activeAnchor.id }).then((snapshot) => {
-      if (!cancelled) {
-        activateConversation(snapshot);
-        void refreshConversationSessions();
-      }
-    }).catch((error: unknown) => {
-      if (!cancelled) {
-        const details = error instanceof Error ? error.message : '未知错误';
-        setConversationError(`对话无法打开：${details}`);
-      }
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [activeAnchor?.id, activateConversation, bridgeAvailable, refreshConversationSessions]);
 
   const activateAnchor = useCallback((anchor: Anchor, shouldScroll = true, note?: Note, draftBody?: string) => {
     setActiveAnchor(anchor);
@@ -1302,22 +1312,20 @@ export function App() {
   }, [activateAnchor, anchors]);
 
   const summary = useMemo(() => normalizeQuote(selectionText), [selectionText]);
-  const conversationQuote = activeConversationContext?.kind === 'ephemeral-selection'
-    ? activeConversationContext.selection.quote
-    : activeConversationContext?.kind === 'saved-anchor'
-      ? anchors.find((anchor) => anchor.id === activeConversationContext.anchorId)?.quote ?? summary
-      : null;
+  const latestAnswer = conversation?.messages.filter((message) => message.role === 'assistant' && message.content.trim()).at(-1);
+  const latestNoteSource = conversation?.contextAnchors.find((anchor) => anchor.id === conversation.activeContextAnchorId) ?? conversation?.contextAnchors.at(-1);
   const pageRenderPriorities = useMemo(() => {
-    const visiblePages = Array.from(visiblePageIndices);
-    if (visiblePages.length === 0) {
+    if (pageCount === 0) {
       return new Map<number, number>();
     }
 
+    const visiblePages = Array.from(visiblePageIndices);
     const currentPageIndex = Math.min(Math.max(currentPage - 1, 0), pageCount - 1);
     const primaryPageIndex = visiblePageIndices.has(currentPageIndex)
       ? currentPageIndex
-      : visiblePages[0];
-    const centers = [primaryPageIndex, ...visiblePages.filter((pageIndex) => pageIndex !== primaryPageIndex)];
+      : visiblePages[0] ?? currentPageIndex;
+    // Keep the reading page mounted even when intersection updates briefly report no visible pages.
+    const centers = [currentPageIndex, ...visiblePages.filter((pageIndex) => pageIndex !== currentPageIndex)];
     const candidates = new Set<number>();
 
     for (const pageIndex of centers) {
@@ -1396,23 +1404,8 @@ export function App() {
         width: pageRect.width / Math.max(pageBounds.width, 1),
         height: pageRect.height / Math.max(pageBounds.height, 1)
       };
-      const normalizedClientRects = geometry.clientRects.flatMap((clientRect) => {
-        const clientLeft = Math.max(clientRect.left, pageBounds.left);
-        const clientTop = Math.max(clientRect.top, pageBounds.top);
-        const clientRight = Math.min(clientRect.right, pageBounds.right);
-        const clientBottom = Math.min(clientRect.bottom, pageBounds.bottom);
-        if (clientRight <= clientLeft || clientBottom <= clientTop) {
-          return [];
-        }
-
-        return [{
-          x: (clientLeft - pageBounds.left) / Math.max(pageBounds.width, 1),
-          y: (clientTop - pageBounds.top) / Math.max(pageBounds.height, 1),
-          width: (clientRight - clientLeft) / Math.max(pageBounds.width, 1),
-          height: (clientBottom - clientTop) / Math.max(pageBounds.height, 1)
-        }];
-      });
-      if (normalizedClientRects.length === 0) {
+      const normalizedRects = normalizeSelectionRects(geometry);
+      if (normalizedRects.length === 0) {
         setSelectionPreview(null);
         return;
       }
@@ -1422,7 +1415,7 @@ export function App() {
         pageIndex: geometry.pageIndex,
         pageRect,
         normalizedRect,
-        normalizedClientRects
+        normalizedRects
       };
 
       const documentId = openedDocumentRef.current?.fingerprint;
@@ -1432,9 +1425,11 @@ export function App() {
 
        setSelectionText(text);
        setActiveAnchor(null);
-       draftSelectionRef.current = { ...nextSelection, documentId };
-       setDraftSelection({ ...nextSelection, documentId });
-       setSelectionPreview({ pageIndex: geometry.pageIndex, rects: normalizeSelectionRects(geometry) });
+       const textLayer = pageSurfaceRef.current?.querySelector(`[data-page-index="${geometry.pageIndex}"] .text-layer`);
+       const readingContext = textLayer && selection.rangeCount ? selectionReadingContext(textLayer, selection.getRangeAt(0)) : undefined;
+       draftSelectionRef.current = { ...nextSelection, documentId, ...readingContext };
+       setDraftSelection({ ...nextSelection, documentId, ...readingContext });
+       setSelectionPreview({ pageIndex: geometry.pageIndex, rects: normalizedRects });
        setNoteBody('');
        setNoteSaveError(null);
        setNoteSaved(false);
@@ -1734,7 +1729,6 @@ export function App() {
         setDraftSelection(null);
         setSelectionPreview(null);
         setSelectionActionPosition(null);
-        setActiveConversationContext({ kind: 'saved-anchor', anchorId: result.anchor.id });
         setConversation((current) => current ? {
           ...current,
           context: { kind: 'saved-anchor', anchorId: result.anchor.id },
@@ -1759,7 +1753,8 @@ export function App() {
           quote: selection.quote,
           normalizedQuote: normalizeQuote(selection.quote),
           pageRect: selection.pageRect,
-          normalizedRect: selection.normalizedRect
+          normalizedRect: selection.normalizedRect,
+          normalizedRects: selection.normalizedRects
         });
         createdAnchor = anchor;
       } else {
@@ -1836,7 +1831,8 @@ export function App() {
         quote: selection.quote,
         normalizedQuote: normalizeQuote(selection.quote),
         pageRect: selection.pageRect,
-        normalizedRect: selection.normalizedRect
+        normalizedRect: selection.normalizedRect,
+        normalizedRects: selection.normalizedRects
       });
 
       if (openedDocumentRef.current?.fingerprint !== currentDocumentId) {
@@ -1857,7 +1853,7 @@ export function App() {
     }
   }
 
-  async function askAiAboutDraft() {
+  async function askAiAboutDraft(prompt?: string) {
     if (!bridgeAvailable) {
       setSelectionActionError('桌面桥接未加载，无法打开 AI 对话。');
       return;
@@ -1868,90 +1864,91 @@ export function App() {
       setSelectionActionError('所选文本已不属于当前文档。');
       return;
     }
-    const previousConversation = conversationRef.current;
-    const previousConversationId = conversationIdRef.current;
-    if (previousConversationId && previousConversation?.context.kind === 'ephemeral-selection' && conversationRunningRef.current) {
-      if (!await requestConfirmation({ title: '切换 AI 对话？', message: '当前回答会被停止，并改为询问新选区。', confirmLabel: '切换对话' })) {
-        return;
-      }
-      try {
-        await window.shuding.discardConversation(previousConversationId);
-        conversationSnapshotsRef.current.delete(previousConversationId);
-        if (conversationIdRef.current === previousConversationId) {
-          clearEphemeralConversationLocal();
-        }
-        await refreshConversationSessions();
-      } catch (error: unknown) {
-        const details = error instanceof Error ? error.message : '未知错误';
-        setSelectionActionError(`临时对话清理失败：${details}`);
-        return;
-      }
-    }
     if (openedDocumentRef.current?.fingerprint !== currentDocumentId) return;
     setSelectionActionError(null);
     setSelectionActionPosition(null);
     setAiView('chat');
     setDrawerMode('ai');
     try {
-      const snapshot = await window.shuding.openConversation({
-        kind: 'ephemeral-selection',
-        selection: {
-          documentFingerprint: selection.documentId,
-          pageIndex: selection.pageIndex,
-          quote: selection.quote,
-          normalizedQuote: normalizeQuote(selection.quote),
-          pageRect: selection.pageRect,
-          normalizedRect: selection.normalizedRect
-        }
-      });
-      if (openedDocumentRef.current?.fingerprint !== currentDocumentId) {
-        await window.shuding.discardConversation(snapshot.conversationId);
-        return;
-      }
-      activateConversation(snapshot);
-      await refreshConversationSessions();
+      await ensureReadingConversation();
+      if (openedDocumentRef.current?.fingerprint !== currentDocumentId) return;
+      if (prompt) await sendConversationMessage(prompt, await captureSelectionContext(selection));
+      else conversationInputRef.current?.focus();
     } catch (error: unknown) {
       const details = error instanceof Error ? error.message : '未知错误';
       if (draftSelectionRef.current === selection) setConversationError(`对话无法打开：${details}`);
     }
   }
 
+  async function ensureReadingConversation() {
+    const documentFingerprint = openedDocumentRef.current?.fingerprint;
+    if (!bridgeAvailable || !documentFingerprint) throw new Error('请先打开一本书');
+    const current = conversationRef.current;
+    const currentDocument = current?.context.kind === 'document' ? current.context.documentFingerprint
+      : current?.context.kind === 'ephemeral-selection' ? current.context.selection.documentFingerprint
+      : current?.contextAnchors[0]?.documentFingerprint;
+    if (current && currentDocument === documentFingerprint) return current;
+    const pending = preparingConversationRef.current;
+    if (pending?.documentFingerprint === documentFingerprint && pending.request === conversationRequestRef.current) return pending.promise;
+    const request = ++conversationRequestRef.current;
+    const promise = (async () => {
+      const recent = await window.shuding.listConversationSessions({ documentFingerprint });
+      if (request !== conversationRequestRef.current || openedDocumentRef.current?.fingerprint !== documentFingerprint) throw new Error('当前对话已更改');
+      const latest = recent[0];
+      const snapshot = latest
+        ? await window.shuding.resumeConversation({ conversationId: latest.conversationId, documentFingerprint })
+        : await window.shuding.openConversation({ kind: 'document', documentFingerprint });
+      if (request !== conversationRequestRef.current || openedDocumentRef.current?.fingerprint !== documentFingerprint) throw new Error('当前对话已更改');
+      activateConversation(snapshot);
+      void refreshConversationSessions();
+      return snapshot;
+    })();
+    preparingConversationRef.current = { documentFingerprint, request, promise };
+    try { return await promise; }
+    finally { if (preparingConversationRef.current?.promise === promise) preparingConversationRef.current = null; }
+  }
+
+  async function captureReadingContext(mode?: 'voice-page'): Promise<ConversationReadingContext | undefined> {
+    const documentFingerprint = openedDocumentRef.current?.fingerprint;
+    if (!documentFingerprint) return undefined;
+    const selection = draftSelectionRef.current;
+    if (selection?.documentId === documentFingerprint) return captureSelectionContext(selection, mode);
+    const readingPdf = pdf;
+    const pageIndex = currentPage - 1;
+    if (!readingPdf) return undefined;
+    const page = await readingPdf.getPage(pageIndex + 1);
+    const content = await page.getTextContent();
+    const quote = content.items.map((item) => 'str' in item ? item.str : '').join(' ').replace(/\s+/g, ' ').trim().slice(0, 8_000);
+    return quote ? { documentFingerprint, pageIndex, quote, kind: 'page', mode } : undefined;
+  }
+
+  async function captureSelectionContext(selection: DraftSelection, mode?: 'voice-page'): Promise<ConversationReadingContext> {
+    let surroundingText = selection.surroundingText;
+    let selectedSentence = selection.selectedSentence;
+    if (!surroundingText && pdf) {
+      const page = await pdf.getPage(selection.pageIndex + 1);
+      const content = await page.getTextContent();
+      const text = content.items.map((item) => 'str' in item ? item.str : '').join(' ').replace(/\s+/g, ' ').trim();
+      const start = normalizeQuote(text).indexOf(normalizeQuote(selection.quote));
+      const context = start >= 0 ? extractSelectionContext(text, start, start + selection.quote.length) : { surroundingText: text.slice(0, 8_000), selectedSentence: undefined };
+      surroundingText = context.surroundingText;
+      selectedSentence = context.selectedSentence;
+    }
+    return { documentFingerprint: selection.documentId, pageIndex: selection.pageIndex, quote: selection.quote.slice(0, 8_000), surroundingText, selectedSentence, kind: 'selection', mode };
+  }
+
   async function openConversationSession(session: ConversationSessionSummary) {
     if (!bridgeAvailable || openedDocumentRef.current?.fingerprint !== session.documentFingerprint) return;
-    const cached = conversationSnapshotsRef.current.get(session.conversationId);
-    if (cached) {
-      activateConversation(cached, session.status);
-      setAiView('chat');
-      setDrawerMode('ai');
-      return;
-    }
-
+    const request = ++conversationRequestRef.current;
     try {
-      const cachedContext = conversationSnapshotsRef.current.get(session.conversationId)?.context;
-      const savedAnchor = session.contextKind === 'saved-anchor'
-        ? anchors.find((anchor) => anchor.documentId === session.documentFingerprint && anchor.pageIndex === session.pageIndex && normalizeQuote(anchor.quote) === normalizeQuote(session.quote))
-        : null;
-      const context = cachedContext ?? (savedAnchor ? { kind: 'saved-anchor' as const, anchorId: savedAnchor.id } : session.contextKind === 'document' ? { kind: 'document' as const, documentFingerprint: session.documentFingerprint } : null);
-      if (!context) {
-        setConversationError('该对话上下文暂时无法恢复。');
-        return;
-      }
-      if (session.contextKind === 'saved-anchor' && !savedAnchor) {
-        if (context.kind !== 'saved-anchor') {
-          setConversationError('该保存引用已不在当前文档中。');
-          return;
-        }
-      }
-      if (context.kind === 'ephemeral-selection' && context.selection.documentFingerprint !== session.documentFingerprint) {
-        setConversationError('该对话不属于当前文档。');
-        return;
-      }
-      const snapshot = await window.shuding.openConversation(context);
-      activateConversation(snapshot, session.status);
+      const snapshot = await window.shuding.resumeConversation({ conversationId: session.conversationId, documentFingerprint: session.documentFingerprint });
+      if (request !== conversationRequestRef.current || openedDocumentRef.current?.fingerprint !== session.documentFingerprint) return;
+      activateConversation(snapshot);
       setAiView('chat');
       setDrawerMode('ai');
       await refreshConversationSessions();
     } catch (error: unknown) {
+      if (request !== conversationRequestRef.current || openedDocumentRef.current?.fingerprint !== session.documentFingerprint) return;
       const details = error instanceof Error ? error.message : '未知错误';
       setConversationError(`对话无法打开：${details}`);
     }
@@ -1966,10 +1963,8 @@ export function App() {
     setAiView('chat');
     setDrawerMode('ai');
     try {
-      const snapshot = await window.shuding.openConversation({ kind: 'document', documentFingerprint });
-      if (openedDocumentRef.current?.fingerprint !== documentFingerprint) return;
-      activateConversation(snapshot);
-      await refreshConversationSessions();
+      await ensureReadingConversation();
+      conversationInputRef.current?.focus();
     } catch (error: unknown) {
       setConversationError(`对话无法打开：${error instanceof Error ? error.message : '未知错误'}`);
     }
@@ -1978,31 +1973,17 @@ export function App() {
   async function openFreshDocumentConversation() {
     const documentFingerprint = openedDocumentRef.current?.fingerprint;
     if (!bridgeAvailable || !documentFingerprint) return;
+    const request = ++conversationRequestRef.current;
     try {
       const snapshot = await window.shuding.openConversation({ kind: 'document', documentFingerprint, fresh: true });
-      if (openedDocumentRef.current?.fingerprint !== documentFingerprint) return;
+      if (request !== conversationRequestRef.current || openedDocumentRef.current?.fingerprint !== documentFingerprint) return;
       activateConversation(snapshot);
       setAiView('chat');
       setDrawerMode('ai');
       await refreshConversationSessions();
     } catch (error: unknown) {
+      if (request !== conversationRequestRef.current || openedDocumentRef.current?.fingerprint !== documentFingerprint) return;
       setConversationError(`新建对话失败：${error instanceof Error ? error.message : '未知错误'}`);
-    }
-  }
-
-  async function clearDocumentConversation() {
-    const current = conversationRef.current;
-    if (!current || current.context.kind !== 'document' || !bridgeAvailable) return;
-    if (conversationRunningRef.current) {
-      setConversationError('请先停止当前回答，再清除对话上下文。');
-      return;
-    }
-    try {
-      await window.shuding.deleteConversationSession(current.conversationId);
-      conversationSnapshotsRef.current.delete(current.conversationId);
-      await openFreshDocumentConversation();
-    } catch (error: unknown) {
-      setConversationError(`清除上下文失败：${error instanceof Error ? error.message : '未知错误'}`);
     }
   }
 
@@ -2060,17 +2041,19 @@ export function App() {
       return;
     }
     try {
-      const snapshot = await window.shuding.openConversation({ kind: 'saved-anchor', anchorId: anchor.id });
+      await ensureReadingConversation();
       if (openedDocumentRef.current?.fingerprint !== anchor.documentId) return;
-      activateConversation(snapshot);
-      await refreshConversationSessions();
+      const selection: DraftSelection = { documentId: anchor.documentId, pageIndex: anchor.pageIndex, quote: anchor.quote, pageRect: anchor.pageRect, normalizedRect: anchor.normalizedRect, normalizedRects: anchor.normalizedRects ?? [anchor.normalizedRect] };
+      draftSelectionRef.current = selection;
+      setDraftSelection(selection);
+      conversationInputRef.current?.focus();
     } catch (error: unknown) {
       setConversationError(`对话无法打开：${error instanceof Error ? error.message : '未知错误'}`);
     }
   }
 
   function toggleDocumentConversation() {
-    if (drawerMode === 'ai' && conversation?.context.kind === 'document') {
+    if (drawerMode === 'ai') {
       setDrawerMode(null);
       return;
     }
@@ -2116,17 +2099,7 @@ export function App() {
 
   async function deleteCurrentAnchor(anchor: Anchor) {
     const hasNotes = notesForAnchor(anchor.id).length > 0;
-    const hasConversation = conversationSessions.some((session) => (
-      session.contextKind === 'saved-anchor' &&
-      session.documentFingerprint === anchor.documentId &&
-      session.pageIndex === anchor.pageIndex &&
-      normalizeQuote(session.quote) === normalizeQuote(anchor.quote)
-    )) || (
-      conversationRef.current?.context.kind === 'saved-anchor' &&
-      conversationRef.current.context.anchorId === anchor.id
-    );
-
-    if ((hasNotes || hasConversation) && !await requestConfirmation({ title: '删除这条高亮？', message: '关联的笔记和 AI 对话也会一并删除，此操作无法撤销。', confirmLabel: '删除高亮' })) {
+    if (hasNotes && !await requestConfirmation({ title: '删除这条高亮？', message: '关联笔记会一并删除，AI 对话历史会保留。此操作无法撤销。', confirmLabel: '删除高亮' })) {
       return;
     }
 
@@ -2142,7 +2115,11 @@ export function App() {
       return next;
     });
     if (conversationRef.current?.context.kind === 'saved-anchor' && conversationRef.current.context.anchorId === anchor.id) {
-      clearEphemeralConversationLocal();
+      const id = conversationIdRef.current;
+      if (id) {
+        const snapshot = await window.shuding.resumeConversation({ conversationId: id, documentFingerprint: anchor.documentId });
+        if (conversationIdRef.current === id && openedDocumentRef.current?.fingerprint === anchor.documentId) activateConversation(snapshot);
+      }
     }
     if (activeAnchor?.id === anchor.id) {
       setActiveAnchor(null);
@@ -2174,18 +2151,44 @@ export function App() {
     }
   }
 
-  async function sendConversationMessage(contentOverride?: string) {
+  async function sendConversationMessage(contentOverride?: string, readingContextOverride?: ConversationReadingContext) {
     const content = (contentOverride ?? conversationDraft).trim();
-    if (!conversationId || !content || conversationRunning || !bridgeAvailable) {
+    if (!content || conversationRunningRef.current || savingProposal || !bridgeAvailable) {
       return;
     }
-    const currentConversationId = conversationId;
-    const currentConversation = conversation;
+    const documentFingerprint = openedDocumentRef.current?.fingerprint;
+    if (!documentFingerprint) return;
+    let currentConversationId: string;
+    let readingContext: ConversationReadingContext | undefined;
+    try {
+      // Capture the reading position before awaiting session restoration.
+      const reading = readingContextOverride ? Promise.resolve(readingContextOverride) : captureReadingContext();
+      const [preparedReading, snapshot] = await Promise.all([reading, ensureReadingConversation()]);
+      currentConversationId = snapshot.conversationId;
+      readingContext = preparedReading;
+      if (conversationRunningRef.current || conversationIdRef.current !== currentConversationId || openedDocumentRef.current?.fingerprint !== documentFingerprint) return;
+    } catch (error) {
+      setConversationError(`无法准备提问：${error instanceof Error ? error.message : '未知错误'}`);
+      return;
+    }
+    conversationRunningRef.current = true;
+    conversationTurnRef.current += 1;
+    localConversationSendsRef.current.add(currentConversationId);
+    followConversationRef.current = true;
     setConversationDraft('');
+    conversationDraftRef.current = '';
     setConversationError(null);
+    setConversationNoteStatus(null);
     setAssistantDraft('');
     setToolStatus(null);
     setConversationRunning(true);
+    if (readingContext?.kind === 'selection') {
+      draftSelectionRef.current = null;
+      setDraftSelection(null);
+      setSelectionPreview(null);
+      setSelectionActionPosition(null);
+      window.getSelection()?.removeAllRanges();
+    }
     setConversation((current) => current ? {
       ...current,
       messages: [...current.messages, {
@@ -2196,34 +2199,31 @@ export function App() {
       }]
     } : current);
     try {
-      await window.shuding.sendConversationMessage({ conversationId: currentConversationId, content });
+      await window.shuding.sendConversationMessage({ conversationId: currentConversationId, content, readingContext });
       if (conversationIdRef.current !== currentConversationId) return;
-      // Both saved anchors and whole-document conversations are persisted by
-      // the main process. Reload them so the completed assistant message is
-      // read from the source of truth; only an ephemeral selection lives solely
-      // in this renderer and needs the streaming draft appended here.
-      if (currentConversation && currentConversation.context.kind !== 'ephemeral-selection') {
-        const snapshot = await window.shuding.openConversation(currentConversation.context);
-        if (conversationIdRef.current !== currentConversationId) return;
-        activateConversation(snapshot);
-      } else {
-        setConversation((current) => current ? {
-          ...current,
-          messages: [...current.messages, {
-            id: `completed-${Date.now()}`,
-            role: 'assistant',
-            content: assistantDraftRef.current,
-            createdAt: new Date().toISOString()
-          }]
-        } : current);
-      }
+      // Read this exact session so all conversation kinds retain their captured
+      // context, tool results, and completed messages without opening a new chat.
+      const snapshot = await window.shuding.resumeConversation({ conversationId: currentConversationId, documentFingerprint });
+      if (conversationIdRef.current !== currentConversationId || openedDocumentRef.current?.fingerprint !== documentFingerprint) return;
+      activateConversation(snapshot);
       await refreshConversationSessions();
       setAssistantDraft('');
     } catch (error: unknown) {
       const details = error instanceof Error ? error.message : '未知错误';
-      if (conversationIdRef.current === currentConversationId) setConversationError(`发送失败：${details}`);
+      if (conversationIdRef.current === currentConversationId && openedDocumentRef.current?.fingerprint === documentFingerprint) {
+        try {
+          const snapshot = await window.shuding.resumeConversation({ conversationId: currentConversationId, documentFingerprint });
+          if (conversationIdRef.current === currentConversationId && openedDocumentRef.current?.fingerprint === documentFingerprint) activateConversation(snapshot);
+        } catch { /* The user may have deleted this chat while it was answering. */ }
+        if (conversationIdRef.current === currentConversationId) setConversationError(`发送失败：${details}`);
+        void refreshConversationSessions();
+      }
     } finally {
-      if (conversationIdRef.current === currentConversationId) setConversationRunning(false);
+      localConversationSendsRef.current.delete(currentConversationId);
+      if (conversationIdRef.current === currentConversationId) {
+        conversationRunningRef.current = false;
+        setConversationRunning(false);
+      }
     }
   }
 
@@ -2288,45 +2288,21 @@ export function App() {
 
   async function startPagePushToTalk() {
     const document = openedDocumentRef.current;
-    const page = currentPage;
     if (!bridgeAvailable || !document || !pdf || !aiSettings?.hasApiKey) {
       setSpeechRecognitionError('请先打开 PDF 并配置 AI，再使用按住 Y 提问。');
       return;
     }
-    if (conversationRunningRef.current) {
+    if (conversationRunningRef.current || savingProposal) {
       setSpeechRecognitionError('请等待当前回答完成后，再按住 Y 继续提问。');
       return;
     }
     try {
-      let snapshot = conversationRef.current;
-      const isCurrentPageVoiceSession = snapshot?.context.kind === 'ephemeral-selection' &&
-        snapshot.context.selection.mode === 'voice-page' &&
-        snapshot.context.selection.documentFingerprint === document.fingerprint &&
-        snapshot.context.selection.pageIndex === page - 1;
-      if (!isCurrentPageVoiceSession) {
-        const pdfPage = await pdf.getPage(page);
-        const content = await pdfPage.getTextContent();
-        pdfPage.cleanup();
-        const quote = content.items.map((item) => 'str' in item ? item.str : '').join(' ').replace(/\s+/g, ' ').trim();
-        if (quote.length < 8) throw new Error('当前页没有可定位的文本');
-        snapshot = await window.shuding.openConversation({
-          kind: 'ephemeral-selection',
-          selection: {
-            documentFingerprint: document.fingerprint,
-            pageIndex: page - 1,
-            quote: quote.slice(0, 8_000),
-            normalizedQuote: normalizeQuote(quote.slice(0, 8_000)),
-            pageRect: { x: 0, y: 0, width: 1, height: 1 },
-            normalizedRect: { x: 0, y: 0, width: 1, height: 1 },
-            mode: 'voice-page'
-          }
-        });
-      }
-      if (openedDocumentRef.current?.fingerprint !== document.fingerprint || !snapshot) return;
-      activateConversation(snapshot);
+      const [readingContext] = await Promise.all([captureReadingContext('voice-page'), ensureReadingConversation()]);
+      if (openedDocumentRef.current?.fingerprint !== document.fingerprint || conversationRunningRef.current) return;
+      if (!readingContext) throw new Error('当前页没有可读取的文字，请先选择可复制的原文');
+      speechReadingContextRef.current = readingContext;
       setAiView('chat');
       setDrawerMode('ai');
-      setConversationDraft('');
       speechAutoSendRef.current = true;
       if (!pushToTalkHeldRef.current) {
         speechAutoSendRef.current = false;
@@ -2378,75 +2354,52 @@ export function App() {
     stopSpeechRecognition();
   }
 
-  async function acceptProposal() {
-    if (!pendingProposal || !bridgeAvailable || !conversation) {
-      return;
-    }
-
-    if (conversationRunning) {
-      setConversationError('请先停止当前回答，再保存这条笔记。');
-      return;
-    }
-
+  async function saveAnswerAsNote(body: string, proposalId?: string) {
+    const snapshot = conversationRef.current;
+    const source = snapshot?.contextAnchors.find((anchor) => anchor.id === snapshot.activeContextAnchorId) ?? snapshot?.contextAnchors.at(-1);
+    if (!snapshot || !source || !bridgeAvailable || conversationRunningRef.current || savingProposal) return;
+    const documentFingerprint = openedDocumentRef.current?.fingerprint;
+    if (documentFingerprint !== source.documentFingerprint) return;
     setSavingProposal(true);
     setConversationError(null);
+    setConversationNoteStatus(null);
     try {
-      if (conversation.context.kind === 'ephemeral-selection') {
-        const documentFingerprint = openedDocumentRef.current?.fingerprint;
-        const body = ephemeralSummary.trim() || pendingProposal.body;
-        if (!documentFingerprint || documentFingerprint !== conversation.context.selection.documentFingerprint) {
-          setConversationError('当前文档已更改，无法保存这条笔记。');
-          return;
+      let draft: AnchorDraft | undefined = source.selectedSentence ? undefined : anchors.find((anchor) => anchor.documentId === documentFingerprint && anchor.pageIndex === source.pageIndex && normalizeQuote(anchor.quote) === source.normalizedQuote);
+      if (!draft) {
+        navigateToContextAnchor(source);
+        for (let attempt = 0; attempt < 12; attempt++) {
+          if (openedDocumentRef.current?.fingerprint !== documentFingerprint || conversationIdRef.current !== snapshot.conversationId) return;
+          const pageFrame = pageSurfaceRef.current?.querySelector<HTMLElement>(`[data-page-index="${source.pageIndex}"]`);
+          const geometry = pageFrame ? resolveQuoteHighlight(pageFrame, source) : null;
+          if (geometry) {
+            draft = geometry;
+            break;
+          }
+          await new Promise((resolve) => window.setTimeout(resolve, 250));
         }
-
-        const result = await window.shuding.finalizeEphemeral({
-          conversationId: pendingProposal.conversationId,
-          documentFingerprint,
-          proposalId: pendingProposal.id,
-          body
-        });
-        if (openedDocumentRef.current?.fingerprint !== documentFingerprint) {
-          return;
-        }
-        setAnchors((current) => [...current, result.anchor]);
-        if (result.note) {
-          setNotesByAnchorId((current) => ({
-            ...current,
-            [result.note!.anchorId]: [...(current[result.note!.anchorId] ?? []), result.note!]
-          }));
-        }
-        setActiveAnchor(result.anchor);
-        setSelectionText(result.anchor.quote);
-        setDraftSelection(null);
-        setSelectionActionPosition(null);
-        setActiveConversationContext({ kind: 'saved-anchor', anchorId: result.anchor.id });
-        setConversation((current) => current ? {
-          ...current,
-          context: { kind: 'saved-anchor', anchorId: result.anchor.id },
-          pendingProposal: null
-        } : current);
-        setPendingProposal(null);
-        setEphemeralSummary('');
-        void refreshConversationSessions();
-      } else {
-        const savedNote = await window.shuding.confirmNoteProposal({
-          conversationId: pendingProposal.conversationId,
-          proposalId: pendingProposal.id
-        });
-        setNotesByAnchorId((current) => ({
-          ...current,
-          [savedNote.anchorId]: [...(current[savedNote.anchorId] ?? []), savedNote]
-        }));
+      }
+      if (!draft) throw new Error('暂时无法定位原文，请稍后重试');
+      if (openedDocumentRef.current?.fingerprint !== documentFingerprint || conversationIdRef.current !== snapshot.conversationId) return;
+      const result = await window.shuding.saveConversationNote({ conversationId: snapshot.conversationId, contextAnchorId: source.id, highlight: draft, body, proposalId });
+      if (openedDocumentRef.current?.fingerprint !== documentFingerprint) return;
+      setAnchors((current) => current.some((anchor) => anchor.id === result.anchor.id) ? current : [...current, result.anchor]);
+      if (result.note) setNotesByAnchorId((current) => ({ ...current, [result.note!.anchorId]: [...(current[result.note!.anchorId] ?? []), result.note!] }));
+      if (proposalId && conversationIdRef.current === snapshot.conversationId) {
         setConversation((current) => current ? { ...current, pendingProposal: null } : current);
         setPendingProposal(null);
-        void refreshConversationSessions();
+        setEphemeralSummary('');
       }
+      if (conversationIdRef.current === snapshot.conversationId) setConversationNoteStatus(`已保存为第 ${source.pageIndex + 1} 页的笔记`);
     } catch (error: unknown) {
       const details = error instanceof Error ? error.message : '未知错误';
-      setConversationError(`保存建议失败：${details}`);
+      setConversationError(`笔记保存失败：${details}`);
     } finally {
       setSavingProposal(false);
     }
+  }
+
+  async function acceptProposal() {
+    if (pendingProposal) await saveAnswerAsNote(ephemeralSummary.trim() || pendingProposal.body, pendingProposal.id);
   }
 
   async function discardProposal() {
@@ -2469,15 +2422,21 @@ export function App() {
     if (!bridgeAvailable) {
       return;
     }
-    if (!await requestConfirmation({ title: '删除这条 AI 对话？', message: '引用和笔记会保留，但对话记录无法恢复。', confirmLabel: '删除对话' })) {
+    const documentFingerprint = openedDocumentRef.current?.fingerprint;
+    if (!await requestConfirmation({ title: '删除这条 AI 对话？', message: '已保存的高亮和笔记会保留，但对话记录无法恢复。', confirmLabel: '删除对话' })) {
       return;
     }
+    if (openedDocumentRef.current?.fingerprint !== documentFingerprint) return;
+    const request = ++conversationRequestRef.current;
     try {
       await window.shuding.deleteConversationSession(conversationId);
-      conversationSnapshotsRef.current.delete(conversationId);
-      if (conversationIdRef.current === conversationId) {
+      if (request === conversationRequestRef.current && conversationIdRef.current === conversationId && openedDocumentRef.current?.fingerprint === documentFingerprint) {
         clearEphemeralConversationLocal();
+        const clearedRequest = conversationRequestRef.current;
+        const recent = await window.shuding.listConversationSessions({ documentFingerprint: documentFingerprint! });
+        if (clearedRequest === conversationRequestRef.current && openedDocumentRef.current?.fingerprint === documentFingerprint && recent[0]) await openConversationSession(recent[0]);
       }
+      conversationDraftsRef.current.delete(conversationId);
       await refreshConversationSessions();
     } catch (error: unknown) {
       const details = error instanceof Error ? error.message : '未知错误';
@@ -2621,9 +2580,9 @@ export function App() {
                 aria-expanded={drawerMode === 'ai'}
                 aria-controls="contextual-drawer"
                 onClick={toggleDocumentConversation}
-                title="打开整本书 AI 对话"
+                title="向 AI 提问，自动参考当前阅读内容"
               >
-                整本书
+                问 AI
               </button>
               <button
                 ref={settingsTriggerRef}
@@ -2678,7 +2637,7 @@ export function App() {
                   draftRects={selectionPreview?.pageIndex === pageIndex
                     ? selectionPreview.rects
                     : draftSelection?.pageIndex === pageIndex
-                      ? draftSelection.normalizedClientRects
+                      ? draftSelection.normalizedRects
                       : []}
                   onViewportChange={onViewportChange}
                 />
@@ -2851,14 +2810,14 @@ export function App() {
               aria-selected={aiView === 'list'}
               onClick={() => setAiView('list')}
             >
-              会话
+              历史
             </button>
           </div>
           {aiView === 'list' ? (
             <section className="session-queue" aria-labelledby="session-queue-title">
               <div className="session-queue-header">
-                <h3 id="session-queue-title">最近 AI 对话</h3>
-                <span>{conversationSessions.length} / 10</span>
+                <h3 id="session-queue-title">本书对话历史</h3>
+                <span>{conversationSessions.length} 条</span>
               </div>
               {conversationSessions.length > 0 ? (
                 <div className="session-list">
@@ -2873,8 +2832,8 @@ export function App() {
                         onClick={() => void openConversationSession(session)}
                         aria-current={session.conversationId === conversationId ? 'true' : undefined}
                       >
-                        <span className="session-quote">{session.contextKind === 'document' ? '整本书对话' : normalizeQuote(session.quote)}</span>
-                        <small>{session.contextKind === 'document' ? '未绑定引用' : `页 ${session.pageIndex + 1} · `}{formatSessionTime(session.lastUsedAt)} · {session.status === 'running' ? '运行中' : '已暂停'}</small>
+                        <span className="session-quote">{session.title}</span>
+                        <small>{`第 ${session.pageIndex + 1} 页 · `}{formatSessionTime(session.lastUsedAt)}{session.status === 'running' ? ' · 正在回答' : ''}</small>
                       </button>
                       <button
                         className="session-delete"
@@ -2893,68 +2852,79 @@ export function App() {
             </section>
           ) : (
           <>
-          {conversationQuote ? (
-            <section className="quote-context">
-              <p className="quote-context-label">对话引用</p>
-              <div className="quote-context-meta">
-                {activeConversationContext?.kind === 'ephemeral-selection'
-                  ? `第 ${activeConversationContext.selection.pageIndex + 1} 页`
-                  : activeConversationContext?.kind === 'saved-anchor'
-                    ? `已保存引用`
-                    : null}
-                {typeof conversationQuote === 'string' && conversationQuote.length > 0
-                  ? ` · ${conversationQuote.length} 字`
-                  : null}
-              </div>
-              {quoteExpanded ? (
-                <p className="quote-context-full">{normalizeQuote(conversationQuote)}</p>
-              ) : (
-                <p className="quote-context-preview">{normalizeQuote(conversationQuote)}</p>
-              )}
-              <button
-                type="button"
-                className="quote-expand-toggle"
-                aria-expanded={quoteExpanded}
-                onClick={() => setQuoteExpanded((value) => !value)}
-              >
-                {quoteExpanded ? '收起' : '展开'}
-              </button>
-              <button type="button" className="quote-expand-toggle quote-detach-toggle" onClick={() => void openDocumentConversation()}>
-                取消引用
-              </button>
+          {conversation && conversation.contextAnchors.length > 0 ? (
+            <section className="conversation-context-anchors" aria-label="参考原文">
+              <details>
+                <summary>参考原文 · {conversation.contextAnchors.length}</summary>
+                <div className="context-anchor-list">
+                  {conversation.contextAnchors.map((anchor) => (
+                    <button className="context-anchor-item" type="button" key={anchor.id} onClick={() => navigateToContextAnchor(anchor)} title="查看原文">
+                      <small>第 {anchor.pageIndex + 1} 页 · 点击查看</small>
+                      <span>{anchor.quote}</span>
+                    </button>
+                  ))}
+                </div>
+              </details>
             </section>
           ) : null}
           {conversation ? (
           <section className="drawer-section conversation-panel">
-            {conversation.context.kind === 'document' ? (
-              <div className="document-conversation-toolbar" aria-label="整本书对话操作">
-                <span className="document-conversation-title">整本书对话</span>
+              <div className="document-conversation-toolbar" aria-label="对话操作">
+                <span className="document-conversation-title">继续聊这本书</span>
                 <div className="document-conversation-actions">
-                  <button type="button" title="新建一段整本书对话" aria-label="新建对话" onClick={() => void openFreshDocumentConversation()} disabled={conversationRunning}>＋</button>
-                  <button type="button" title="清除当前对话上下文" aria-label="清除上下文" onClick={() => void clearDocumentConversation()} disabled={conversationRunning}>⌫</button>
+                  <button type="button" title="保留当前记录，开始新的讨论" onClick={() => void openFreshDocumentConversation()} disabled={conversationRunning || savingProposal}>新话题</button>
                 </div>
               </div>
-            ) : null}
-            <div className="conversation-messages" aria-live="polite">
-              {conversation?.messages.map((message: ConversationMessage) => (
+            <div className="conversation-messages" ref={conversationMessagesRef} onScroll={(event) => {
+              const list = event.currentTarget;
+              followConversationRef.current = list.scrollHeight - list.scrollTop - list.clientHeight < 60;
+            }} aria-live="polite">
+              {conversation.messages.filter((message) => message.role !== 'toolResult').map((message: ConversationMessage) => (
                 <div className={`conversation-message ${message.role}`} key={message.id}>
-                  <small>{message.role === 'user' ? '你' : message.role === 'assistant' ? 'AI' : message.toolName ?? '工具'}</small>
+                  <small>{message.role === 'user' ? '你' : 'AI'}</small>
                   {message.role === 'assistant'
                     ? <MarkdownContent source={message.content || ''} />
-                    : <p>{message.content || '已完成工具调用'}</p>}
+                    : <p>{message.content}</p>}
+                  {message.interrupted ? <small>回答未完成，可以继续追问</small> : null}
+                  {message.id === latestAnswer?.id && conversation.contextAnchors.length > 0 ? (
+                    <button className="answer-save-note" type="button" onClick={() => void saveAnswerAsNote(message.content)} disabled={conversationRunning || savingProposal} title={`附在第 ${latestNoteSource!.pageIndex + 1} 页原文处`}>
+                      {savingProposal ? '正在保存…' : '存为笔记'}
+                    </button>
+                  ) : null}
                 </div>
               ))}
               {assistantDraft ? <div className="conversation-message assistant streaming"><small>AI</small><MarkdownContent source={assistantDraft} /></div> : null}
-              {!conversation && !conversationError ? <p className="annotation-empty">正在加载对话。</p> : null}
+              {conversation.messages.length === 0 && !assistantDraft ? (
+                <div className="reading-chat-empty">
+                  <p>不懂的地方，直接问。</p>
+                  <small>自动参考选中文字或当前页，也可以按住 Y 说话。</small>
+                  <button type="button" onClick={() => void sendConversationMessage(draftSelection ? '请用容易理解的语言解释这段原文，指出关键概念，并给一个例子。' : '请概括当前页的重点，用容易理解的语言解释关键概念。')} disabled={!aiSettings?.hasApiKey || conversationRunning || savingProposal}>解释{draftSelection ? '这段文字' : '当前页'}</button>
+                </div>
+              ) : null}
             </div>
             {toolStatus ? <p className="note-status">{toolStatus}</p> : null}
+            <div className="reading-context-hint">
+              <span>{draftSelection ? `本次参考：选中文字 · 第 ${draftSelection.pageIndex + 1} 页` : `自动参考当前页 · 第 ${currentPage} 页`}</span>
+              {draftSelection ? <button type="button" aria-label="取消本次选区引用" onClick={() => {
+                draftSelectionRef.current = null;
+                setDraftSelection(null);
+                setSelectionPreview(null);
+                setSelectionActionPosition(null);
+                window.getSelection()?.removeAllRanges();
+              }}>×</button> : null}
+            </div>
             <div className="conversation-input">
-              <textarea value={conversationDraft} onChange={(event) => setConversationDraft(event.target.value)} placeholder={conversation.context.kind === 'document' ? '向这本书提问，或请 Harness 帮你查找内容' : '围绕当前引用提问'} disabled={conversationRunning || speechRecognitionState !== 'idle'} />
+              <textarea ref={conversationInputRef} value={conversationDraft} onChange={(event) => setConversationDraft(event.target.value)} onKeyDown={(event) => {
+                if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+                  event.preventDefault();
+                  void sendConversationMessage();
+                }
+              }} placeholder={draftSelection ? '想问这段文字什么？' : '直接提问，或继续追问…'} aria-label="向 AI 提问" disabled={speechRecognitionState !== 'idle'} />
               <button
                 className={`speech-input-button${speechRecognitionState !== 'idle' ? ' listening' : ''}`}
                 type="button"
                 onClick={toggleSpeechRecognition}
-                disabled={conversationRunning || !aiSettings?.hasApiKey || speechRecognitionState === 'transcribing'}
+                disabled={conversationRunning || savingProposal || !aiSettings?.hasApiKey || speechRecognitionState === 'transcribing'}
                 aria-label={speechRecognitionState === 'idle' ? '开始语音输入' : '停止语音输入'}
                 aria-keyshortcuts="Y"
                 title={speechRecognitionState === 'idle' ? '开始语音输入（按住 Y 可对当前页提问）' : '停止语音输入'}
@@ -2964,29 +2934,28 @@ export function App() {
             </div>
             {speechRecognitionState === 'listening' ? <p className="voice-status" role="status">正在实时听写，临时结果会随语音修正</p> : speechRecognitionState === 'transcribing' ? <p className="voice-status" role="status">正在生成最终转写…</p> : null}
             <div className="conversation-actions">
-              <button className="primary" type="button" onClick={() => void sendConversationMessage()} disabled={conversationRunning || !conversationDraft.trim() || !aiSettings?.hasApiKey}>
+              <button className="primary" type="button" onClick={() => void sendConversationMessage()} disabled={conversationRunning || savingProposal || !conversationDraft.trim() || !aiSettings?.hasApiKey}>
                 发送
               </button>
-              <button type="button" onClick={() => conversationId && void window.shuding.abortConversation(conversationId)} disabled={!conversationRunning}>
+              {conversationRunning ? <button type="button" onClick={() => conversationId && void window.shuding.abortConversation(conversationId)}>
                 停止
-              </button>
+              </button> : <small className="send-key-hint">Enter 发送 · Shift+Enter 换行</small>}
             </div>
             {!aiSettings?.hasApiKey ? <p className="note-status error">保存安全 API Key 后即可开始对话。</p> : null}
             {speechRecognitionError ? <p className="note-status error">{speechRecognitionError}</p> : null}
             {conversationError ? <p className="note-status error">{conversationError}</p> : null}
+            {conversationNoteStatus ? <p className="note-status" role="status">{conversationNoteStatus}</p> : null}
             {pendingProposal ? (
               <div className="proposal-preview">
                 <h3>AI 笔记建议</h3>
-                {conversation.context.kind === 'ephemeral-selection' ? (
                   <textarea
                     value={ephemeralSummary}
                     onChange={(event) => setEphemeralSummary(event.target.value)}
                     placeholder={pendingProposal.body}
                     aria-label="编辑 AI 笔记建议"
                   />
-                ) : <p>{pendingProposal.body}</p>}
                 <div className="conversation-actions">
-                  <button className="primary" type="button" onClick={() => void acceptProposal()} disabled={savingProposal || conversationRunning}>
+                  <button className="primary" type="button" onClick={() => void acceptProposal()} disabled={savingProposal || conversationRunning || conversation.contextAnchors.length === 0}>
                     {savingProposal ? '加入中' : '加入笔记'}
                   </button>
                   <button type="button" onClick={() => void discardProposal()} disabled={savingProposal}>丢弃建议</button>
@@ -2996,7 +2965,7 @@ export function App() {
             {bookIndexConsent ? (
               <div className="book-index-consent">
                 <h3>启用本书智能检索？</h3>
-                <p>Harness 需要先在本机建立这本书的索引，才能查找定义、定理和相关页面。内容不会上传。</p>
+                <p>在本机建立索引后，就能查找书中的定义、定理和相关页面。索引保存在本机。</p>
                 <small>预计占用约 {Math.round(bookIndexConsent.estimatedDiskBytes / 1024 / 1024)} MB 磁盘空间；构建时会使用 CPU。</small>
                 <div className="conversation-actions">
                   <button className="primary" type="button" onClick={() => void respondToBookIndexConsent(true)} disabled={buildingBookIndex}>
@@ -3027,7 +2996,8 @@ export function App() {
           </section>
           ) : (
             <section className="drawer-section ai-empty-state">
-              <p>先选中一段文字并使用“询问 AI”，或从标注中选择已保存引用。</p>
+              <p>打开对话即可直接提问，自动参考当前页。</p>
+              <button type="button" onClick={() => void openDocumentConversation()}>开始提问</button>
               {!aiSettings?.hasApiKey ? <p className="note-status error">保存安全 API Key 后即可开始对话。</p> : null}
               {conversationError ? <p className="note-status error">{conversationError}</p> : null}
             </section>
@@ -3047,6 +3017,7 @@ export function App() {
           aria-label="所选文本操作"
         >
           <button type="button" onClick={() => void saveDraftHighlight()}>添加高亮</button>
+          <button type="button" onClick={() => void askAiAboutDraft('请用容易理解的语言解释这段原文，指出关键概念，并给一个例子。')} disabled={conversationRunning || savingProposal || !aiSettings?.hasApiKey}>解释一下</button>
           <button type="button" onClick={openDraftNoteEditor}>添加笔记</button>
           <button type="button" onClick={() => void askAiAboutDraft()}>询问 AI</button>
           <button type="button" onClick={() => void copyDraftSelection()}>复制</button>

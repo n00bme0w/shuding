@@ -7,6 +7,7 @@ export type Rect = {
   height: number;
 };
 
+// Legacy storage name: these are user-saved PDF highlights, not AI context anchors.
 export type Anchor = {
   id: string;
   documentId: string;
@@ -16,6 +17,7 @@ export type Anchor = {
   normalizedQuote: string;
   pageRect: Rect;
   normalizedRect: Rect;
+  normalizedRects?: Rect[];
   confidence?: number;
   createdAt: string;
   updatedAt: string;
@@ -52,6 +54,7 @@ export type AnchorDraft = {
   normalizedQuote: string;
   pageRect: Rect;
   normalizedRect: Rect;
+  normalizedRects?: Rect[];
   confidence?: number;
 };
 
@@ -87,6 +90,7 @@ export type ConversationMessage = {
   content: string;
   createdAt: string;
   toolName?: string;
+  interrupted?: boolean;
 };
 
 export type PendingNoteProposal = {
@@ -112,6 +116,7 @@ export type EphemeralSelectionConversationContext = {
     normalizedQuote: string;
     pageRect: Rect;
     normalizedRect: Rect;
+    normalizedRects?: Rect[];
     mode?: 'voice-page';
   };
 };
@@ -127,10 +132,36 @@ export type ConversationContext =
   | EphemeralSelectionConversationContext
   | DocumentConversationContext;
 
+export type ConversationAnchor = {
+  id: string;
+  documentFingerprint: string;
+  pageIndex: number;
+  quote: string;
+  surroundingText?: string;
+  selectedSentence?: string;
+  normalizedQuote: string;
+  source: 'selection' | 'highlight' | 'current-page' | 'search';
+  createdAt: string;
+};
+
+export type ConversationReadingContext = {
+  documentFingerprint: string;
+  pageIndex: number;
+  quote: string;
+  surroundingText?: string;
+  selectedSentence?: string;
+  kind: 'selection' | 'page';
+  mode?: 'voice-page';
+};
+
 export type ConversationSnapshot = {
   conversationId: string;
+  status: ConversationStatus;
+  streamingText?: string;
   context: ConversationContext;
   messages: ConversationMessage[];
+  contextAnchors: ConversationAnchor[];
+  activeContextAnchorId?: string;
   pendingProposal: PendingNoteProposal | null;
 };
 
@@ -141,6 +172,7 @@ export type ConversationSessionSummary = {
   documentFingerprint: string;
   contextKind: ConversationContext['kind'];
   quote: string;
+  title: string;
   pageIndex: number;
   lastUsedAt: string;
   status: ConversationStatus;
@@ -153,8 +185,8 @@ export type ConversationEvent =
   | { type: 'proposal'; conversationId: string; proposal: PendingNoteProposal }
   | { type: 'error'; conversationId: string; message: string }
   | { type: 'index_consent'; conversationId: string; documentFingerprint: string; estimatedDiskBytes: number }
-  | { type: 'navigate_to_page'; conversationId: string; documentFingerprint: string; page: number; reason?: string; quote?: string }
-  | { type: 'auto_anchor'; conversationId: string; documentFingerprint: string; page: number; quote: string };
+  | { type: 'context_anchor'; conversationId: string; anchor: ConversationAnchor }
+  | { type: 'navigate_to_page'; conversationId: string; documentFingerprint: string; page: number; reason?: string; quote?: string };
 
 export type ConfirmNoteProposalInput = {
   conversationId: string;
@@ -163,6 +195,11 @@ export type ConfirmNoteProposalInput = {
 
 export type OpenConversationInput = ConversationContext;
 
+export type ResumeConversationInput = {
+  conversationId: string;
+  documentFingerprint: string;
+};
+
 export type ListConversationSessionsInput = {
   documentFingerprint: string;
 };
@@ -170,6 +207,15 @@ export type ListConversationSessionsInput = {
 export type SendConversationInput = {
   conversationId: string;
   content: string;
+  readingContext?: ConversationReadingContext;
+};
+
+export type SaveConversationNoteInput = {
+  conversationId: string;
+  contextAnchorId: string;
+  highlight: AnchorDraft;
+  body: string;
+  proposalId?: string;
 };
 
 export type FinalizeEphemeralInput = {

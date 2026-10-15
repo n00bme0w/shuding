@@ -37,7 +37,10 @@ import {
   listConversationSessions,
   openConversation,
   removeConversationOwner,
+  checkpointConversations,
+  resumeConversation,
   saveSettings,
+  saveConversationNote,
   sendConversationMessage
 } from './ai/service';
 import { pushVoiceAudio, startVoiceStream, stopVoiceService, stopVoiceStream } from './asr/service';
@@ -50,7 +53,9 @@ import type {
   FinalizeEphemeralInput,
   ListConversationSessionsInput,
   OpenedDocument,
+  ResumeConversationInput,
   SaveAiSettingsInput,
+  SaveConversationNoteInput,
   SaveNoteInput,
   SaveReadingStateInput,
   SendConversationInput,
@@ -245,6 +250,11 @@ ipcMain.handle('conversation:open', async (event, context: ConversationContext) 
   return await openConversation(context, eventOwner(sender));
 });
 
+ipcMain.handle('conversation:resume', (event, input: ResumeConversationInput) => {
+  const sender = assertTrustedSender(event);
+  return resumeConversation(input, eventOwner(sender));
+});
+
 ipcMain.handle('conversation:list-by-document', async (event, input: ListConversationSessionsInput) => {
   const sender = assertTrustedSender(event);
   return listConversationSessions(input.documentFingerprint, sender.id);
@@ -252,7 +262,12 @@ ipcMain.handle('conversation:list-by-document', async (event, input: ListConvers
 
 ipcMain.handle('conversation:send', async (event, input: SendConversationInput) => {
   const sender = assertTrustedSender(event);
-  await sendConversationMessage(input.conversationId, input.content, eventOwner(sender));
+  await sendConversationMessage(input.conversationId, input.content, eventOwner(sender), input.readingContext);
+});
+
+ipcMain.handle('conversation:save-note', (event, input: SaveConversationNoteInput) => {
+  const sender = assertTrustedSender(event);
+  return saveConversationNote(input, sender.id);
 });
 
 ipcMain.handle('voice:start', async (event) => {
@@ -339,6 +354,7 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+  checkpointConversations();
   stopVoiceService();
   void stopEmbeddingService();
 });

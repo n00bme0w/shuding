@@ -7,11 +7,15 @@
   "license": "Apache-2.0",
   "scripts": {
     "dev": "node scripts/dev.mjs",
+    "install:launcher": "node scripts/install-launcher.mjs",
+    "uninstall:launcher": "node scripts/install-launcher.mjs --uninstall",
     "build": "FONTCONFIG_FILE=\"$PWD/fontconfig/fonts.conf\" FONTCONFIG_PATH=\"$PWD/fontconfig\" electron-vite build",
     "rebuild:native": "electron-rebuild -f -w better-sqlite3",
     "postinstall": "npm run rebuild:native",
     "preview": "FONTCONFIG_FILE=\"$PWD/fontconfig/fonts.conf\" FONTCONFIG_PATH=\"$PWD/fontconfig\" electron-vite preview",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test scripts/test-*.mjs",
+    "test:ui": "FONTCONFIG_FILE=\"$PWD/fontconfig/fonts.conf\" FONTCONFIG_PATH=\"$PWD/fontconfig\" electron scripts/test-reading-ui.cjs"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "file:../pi/packages/agent",
