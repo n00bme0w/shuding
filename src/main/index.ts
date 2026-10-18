@@ -198,7 +198,7 @@ ipcMain.handle('book:index-consent', async (event, input: BookIndexConsentInput)
   assertTrustedSender(event);
   if (input.allowed) {
     const available = await startEmbeddingService();
-    if (!available) throw new Error('本地语义检索服务无法启动');
+    if (!available) throw new Error('本地语义检索服务无法启动。请先运行：python scripts/download-llama-resources.py');
   }
   saveBookIndexStatus(input.documentFingerprint, input.allowed ? 'building' : 'declined');
 });

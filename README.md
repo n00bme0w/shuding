@@ -73,6 +73,9 @@ Keyboard:
 npm install        # postinstall rebuilds better-sqlite3 for the Electron ABI
 npm run dev        # start Electron + renderer dev server
 
+# Optional: install the local BGE-M3 model and llama-server for book indexing
+python scripts/download-llama-resources.py
+
 # Optional: register a global command and desktop launcher for this checkout
 npm run install:launcher
 # Then run it from any directory:

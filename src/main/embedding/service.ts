@@ -62,7 +62,7 @@ export async function startEmbeddingService() {
   const binary = process.env.SHUDING_LLAMA_SERVER ?? await firstExisting(roots.map((root) => path.join(root, platformBinaryName())));
   const model = process.env.SHUDING_BGE_M3_MODEL ?? await firstExisting(roots.map((root) => path.join(root, 'bge-m3.gguf')));
   if (!binary || !model) {
-    console.warn('[embedding] llama-server or bge-m3.gguf is not bundled; semantic search is unavailable.');
+    console.warn('[embedding] llama-server or bge-m3.gguf is missing; run `python scripts/download-llama-resources.py` to install local semantic-search resources.');
     return false;
   }
 

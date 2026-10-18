@@ -75,6 +75,9 @@
 npm install        # 会执行 postinstall：按 Electron ABI 重建 better-sqlite3
 npm run dev        # 启动 Electron + renderer dev server
 
+# 可选：启用全书语义索引前，下载本地 BGE-M3 与 llama-server 运行时
+python scripts/download-llama-resources.py
+
 # 可选：注册一次全局命令和桌面 Launcher（入口直接指向当前源码目录）
 npm run install:launcher
 # 之后可以在任意目录运行：
